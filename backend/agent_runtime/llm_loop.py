@@ -50,7 +50,6 @@ from backend.agent_runtime.output_parser import (
     build_nudge_message as build_output_parser_nudge,
     promote_to_tool_calls,
     strip_extracted_calls,
-    count_prior_nudges,
     is_small_model,
 )
 
@@ -903,30 +902,28 @@ def run_tool_loop(agent: Dict[str, Any],
         #   1. Nudge: tell the model to re-issue using native calling.
         #      Works for capable models that briefly drift off-format.
         #   2. Promote: synthesize OpenAI tool_calls from the extracted
-        #      JSON and execute them. Last-resort for small/weak models
-        #      that cannot recover from a nudge.
-        # We promote when (a) the model is small (1-3B class), or (b) a
-        # prior nudge already failed in this conversation — re-nudging the
-        # same model the same way produces the same output.
+        #      JSON and execute them. Used for small/weak models that
+        #      cannot recover from a nudge.
+        # Auto-promote is gated on is_small_model() only — capable models
+        # are kept on the nudge path to avoid accidentally executing JSON
+        # examples a big LLM might emit while explaining tool formats.
         if not tool_calls and raw_content and has_malformed_calls(raw_content):
             _extracted = detect_malformed_tool_calls(raw_content)
             _promoted = promote_to_tool_calls(_extracted)
-            _prior_nudges = count_prior_nudges(messages)
             _small = is_small_model(getattr(llm, 'model', None))
-            _should_promote = bool(_promoted) and (_small or _prior_nudges >= 1)
+            _should_promote = bool(_promoted) and _small
 
             if _should_promote:
                 _logger.warning(
                     "Promoting %d malformed tool call(s) to native tool_calls "
-                    "(model=%s, small=%s, prior_nudges=%d)",
-                    len(_promoted), getattr(llm, 'model', None), _small, _prior_nudges,
+                    "(model=%s, small=True)",
+                    len(_promoted), getattr(llm, 'model', None),
                 )
                 event_stream.emit('output_parser_promoted', {
                     'agent_id': agent_id,
                     'external_user_id': external_user_id, 'channel_id': channel_id,
                     'promoted_count': len(_promoted),
                     'small_model': _small,
-                    'prior_nudges': _prior_nudges,
                 })
                 tool_calls = _promoted
                 # Strip the bare JSON / fenced / XML spans from the visible
