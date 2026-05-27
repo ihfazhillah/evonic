@@ -48,6 +48,10 @@ from backend.agent_runtime.output_parser import (
     has_malformed_calls,
     detect_all as detect_malformed_tool_calls,
     build_nudge_message as build_output_parser_nudge,
+    promote_to_tool_calls,
+    strip_extracted_calls,
+    count_prior_nudges,
+    is_small_model,
 )
 
 from models.db import db
@@ -895,19 +899,52 @@ def run_tool_loop(agent: Dict[str, Any],
         # --- Output Parser: detect malformed tool calls embedded in text ---
         # If the model produced no native tool_calls but its text contains
         # tool-call-like patterns (fenced ```tool blocks, <tool_call> tags,
-        # or bare JSON with name+arguments), nudge it to use native calling.
+        # or bare JSON with name+arguments) we have two recovery paths:
+        #   1. Nudge: tell the model to re-issue using native calling.
+        #      Works for capable models that briefly drift off-format.
+        #   2. Promote: synthesize OpenAI tool_calls from the extracted
+        #      JSON and execute them. Last-resort for small/weak models
+        #      that cannot recover from a nudge.
+        # We promote when (a) the model is small (1-3B class), or (b) a
+        # prior nudge already failed in this conversation — re-nudging the
+        # same model the same way produces the same output.
         if not tool_calls and raw_content and has_malformed_calls(raw_content):
-            _logger.warning("Malformed tool calls detected in text — injecting nudge")
             _extracted = detect_malformed_tool_calls(raw_content)
-            _nudge = build_output_parser_nudge(_extracted)
-            messages.append({"role": "assistant", "content": raw_content})
-            messages.append({"role": "user", "content": _nudge})
-            event_stream.emit('output_parser_nudge', {
-                'agent_id': agent_id,
-                'external_user_id': external_user_id, 'channel_id': channel_id,
-                'extracted_count': len(_extracted),
-            })
-            continue
+            _promoted = promote_to_tool_calls(_extracted)
+            _prior_nudges = count_prior_nudges(messages)
+            _small = is_small_model(getattr(llm, 'model', None))
+            _should_promote = bool(_promoted) and (_small or _prior_nudges >= 1)
+
+            if _should_promote:
+                _logger.warning(
+                    "Promoting %d malformed tool call(s) to native tool_calls "
+                    "(model=%s, small=%s, prior_nudges=%d)",
+                    len(_promoted), getattr(llm, 'model', None), _small, _prior_nudges,
+                )
+                event_stream.emit('output_parser_promoted', {
+                    'agent_id': agent_id,
+                    'external_user_id': external_user_id, 'channel_id': channel_id,
+                    'promoted_count': len(_promoted),
+                    'small_model': _small,
+                    'prior_nudges': _prior_nudges,
+                })
+                tool_calls = _promoted
+                # Strip the bare JSON / fenced / XML spans from the visible
+                # text so the user doesn't see the raw call syntax.
+                raw_content = strip_extracted_calls(raw_content, _extracted)
+                content = strip_extracted_calls(content or '', _extracted)
+                # Fall through — tool_calls is set, downstream dispatch runs.
+            else:
+                _logger.warning("Malformed tool calls detected in text — injecting nudge")
+                _nudge = build_output_parser_nudge(_extracted)
+                messages.append({"role": "assistant", "content": raw_content})
+                messages.append({"role": "user", "content": _nudge})
+                event_stream.emit('output_parser_nudge', {
+                    'agent_id': agent_id,
+                    'external_user_id': external_user_id, 'channel_id': channel_id,
+                    'extracted_count': len(_extracted),
+                })
+                continue
 
         if content:
             is_final = not bool(tool_calls)
