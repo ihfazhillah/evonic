@@ -90,17 +90,19 @@ var RealtimeClient = (function () {
     RealtimeClient.prototype.pause = function () {
         if (this._paused) return;
         this._paused = true;
-        if (this._es && this._es.readyState === EventSource.OPEN) {
+        if (this._sessionId && this._es && this._es.readyState === EventSource.OPEN) {
             // Send pause signal via a separate fetch
             this._sendCommand('pause');
+            // No session_id: server-side pause has no effect (skip command)
         }
     };
 
     RealtimeClient.prototype.resume = function () {
         if (!this._paused) return;
         this._paused = false;
-        if (this._es && this._es.readyState === EventSource.OPEN) {
+        if (this._sessionId && this._es && this._es.readyState === EventSource.OPEN) {
             this._sendCommand('resume');
+            // No session_id: server-side resume has no effect (skip command)
         }
         // Replay buffered events
         var self = this;
