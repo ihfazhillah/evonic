@@ -1,0 +1,17 @@
+[
+  {
+    "type": "function",
+    "function": {
+      "name": "share_doc",
+      "description": "Create a token-protected, shareable viewer link for one of your markdown artifacts. Returns a viewer URL plus HTML and PDF export URLs. Send the URL to the user instead of pasting long documents. The link is multi-use and expires after the configured TTL (default 7 days). The viewer always renders the current file content.",
+      "parameters": {
+        "type": "object",
+        "properties": {
+          "filename": {"type": "string", "description": "Plain basename of a .md artifact in your artifacts directory, e.g. \"report.md\"."},
+          "template": {"type": "string", "enum": ["paper", "course-dark", "explainer"], "description": "Visual template. Defaults to the plugin DEFAULT_TEMPLATE (paper)."}
+        },
+        "required": ["filename"]
+      }
+    }
+  }
+]
