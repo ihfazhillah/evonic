@@ -96,3 +96,21 @@ def test_files_list_and_detail(env):
     d = env.c.get("/plugin/doc-viewer/files/1")
     assert d.status_code == 200 and b"Contoh Dokumen" in d.data
     assert env.c.get("/plugin/doc-viewer/files/999").status_code == 404
+
+
+def test_detail_nav_and_exports(env):
+    env.mint()
+    assert env.c.get("/plugin/doc-viewer/files/1/export.html").status_code == 404
+    _login(env.c)
+    d = env.c.get("/plugin/doc-viewer/files/1")
+    for u in (b'href="/plugin/doc-viewer/files"', b"/files/1/export.html", b"/files/1/export.pdf"):
+        assert u in d.data
+    h = env.c.get("/plugin/doc-viewer/files/1/export.html")
+    assert h.status_code == 200 and 'filename="sample.html"' in h.headers["Content-Disposition"]
+    assert b"evx-nav" not in h.data
+    assert env.c.get("/plugin/doc-viewer/files/999/export.pdf").status_code == 404
+
+
+def test_token_view_nav_no_back_when_anonymous(env):
+    r = env.c.get(f"/plugin/doc-viewer/v/{env.mint()}")
+    assert b"evx-nav" in r.data and b"export.pdf" in r.data and b"Back to files" not in r.data

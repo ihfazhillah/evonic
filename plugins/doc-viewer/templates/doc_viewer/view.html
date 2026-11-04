@@ -4,6 +4,23 @@
 <link rel="stylesheet" href="{{ url_for('doc_viewer.static', filename='themes/' ~ template ~ '.css') }}">
 </head>
 <body data-template="{{ template }}">
+{% if nav %}<style>
+#evx-nav{all:initial;--evx-bg:#ffffff;--evx-text:#333333;--evx-border:#e5e7eb;--evx-hover:#f3f4f6;--evx-hover-text:#111827;--evx-accent:#4f46e5;
+position:fixed;top:12px;right:12px;z-index:2147483000;display:flex;gap:4px;padding:4px;background:var(--evx-bg);border:1px solid var(--evx-border);
+border-radius:10px;box-shadow:0 4px 14px rgba(15,23,42,.08);font:500 13px/1.2 ui-sans-serif,system-ui,-apple-system,"Segoe UI",sans-serif}
+#evx-nav a.evx-btn{all:unset;box-sizing:border-box;cursor:pointer;display:inline-flex;align-items:center;gap:6px;padding:6px 10px;border-radius:7px;color:var(--evx-text);font:inherit;white-space:nowrap}
+#evx-nav a.evx-btn:hover{background:var(--evx-hover);color:var(--evx-hover-text)}
+#evx-nav a.evx-btn:focus-visible{outline:2px solid var(--evx-accent);outline-offset:1px}
+#evx-nav a.evx-primary{background:var(--evx-accent);color:#fff}#evx-nav a.evx-primary:hover{background:#4338ca;color:#fff}
+#evx-nav .evx-sep{all:initial;width:1px;margin:4px 2px;background:var(--evx-border)}
+@media (prefers-color-scheme:dark){ #evx-nav{--evx-bg:#111827;--evx-text:#e2e8f0;--evx-border:#334155;--evx-hover:#334155;--evx-hover-text:#f1f5f9}}
+@media print{ #evx-nav{display:none}}
+</style>
+<nav id="evx-nav" aria-label="Document actions">
+{% if nav.back %}<a class="evx-btn" href="{{ nav.back }}">&larr; Back to files</a><span class="evx-sep"></span>{% endif %}
+<a class="evx-btn" href="{{ nav.html }}" download>Download HTML</a>
+<a class="evx-btn evx-primary" href="{{ nav.pdf }}" download>Export PDF</a>
+</nav>{% endif %}
 <main id="doc" class="doc"><noscript><pre>{{ markdown }}</pre></noscript></main>
 <script id="doc-src" type="application/json">{{ markdown|tojson }}</script>
 <script src="{{ url_for('doc_viewer.static', filename='vendor/markdown-it.min.js') }}"></script>
