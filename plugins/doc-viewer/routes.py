@@ -1,6 +1,8 @@
 """doc-viewer plugin: token-protected markdown viewer and export routes.
 
   GET /plugin/doc-viewer/                       JSON status probe
+  GET /plugin/doc-viewer/files                  file list (login required)
+  GET /plugin/doc-viewer/files/<id>             file detail (login required)
   GET /plugin/doc-viewer/v/<token>              themed viewer
   GET /plugin/doc-viewer/v/<token>/export.html  (task 8)
   GET /plugin/doc-viewer/v/<token>/export.pdf   (task 9)
@@ -110,6 +112,41 @@ def _export_pdf(token):
     return _secure(resp)
 
 
+def _authed():
+    from flask import session
+    return bool(session.get("authenticated"))
+
+
+def _fmt(ts):
+    return time.strftime("%Y-%m-%d %H:%M", time.localtime(float(ts))) if ts else ""
+
+
+def _files():
+    if not _authed():
+        return _not_found()
+    from flask import make_response
+    now = time.time()
+    rows = view_db.list_all()
+    for r in rows:
+        r["status"] = "revoked" if r.get("revoked_at") else ("expired" if float(r["expires_at"]) <= now else "active")
+        r["created"], r["expires"] = _fmt(r["created_at"]), _fmt(r["expires_at"])
+    return _secure(make_response(render_template("doc_viewer/list.html", rows=rows)))
+
+
+def _file_detail(row_id):
+    if not _authed():
+        return _not_found()
+    row = view_db.get_by_id(row_id)
+    path = (row or {}).get("artifact_path") or ""
+    if not row or os.path.islink(path) or not os.path.isfile(path) or os.path.getsize(path) > MAX_BYTES:
+        return _not_found()
+    with open(path, encoding="utf-8", errors="replace") as f:
+        md = f.read()
+    from flask import make_response
+    return _secure(make_response(render_template("doc_viewer/view.html", title=row["filename"], markdown=md,
+                                                 template=cfg.template(row.get("template")), token=None)))
+
+
 def _status():
     return jsonify({"plugin": "doc-viewer", "version": "0.1.0", "enabled": cfg.enabled()})
 
@@ -120,6 +157,8 @@ def create_blueprint() -> Blueprint:
                    static_folder=os.path.join(PLUGIN_DIR, "static"),
                    static_url_path="/plugin/doc-viewer/static")
     bp.add_url_rule("/plugin/doc-viewer/", "status", _status, methods=["GET"])
+    bp.add_url_rule("/plugin/doc-viewer/files", "files", _files, methods=["GET"])
+    bp.add_url_rule("/plugin/doc-viewer/files/<int:row_id>", "file_detail", _file_detail, methods=["GET"])
     bp.add_url_rule("/plugin/doc-viewer/v/<token>", "view", _view, methods=["GET"])
     bp.add_url_rule("/plugin/doc-viewer/v/<token>/export.html", "export_html", _export_html, methods=["GET"])
     bp.add_url_rule("/plugin/doc-viewer/v/<token>/export.pdf", "export_pdf", _export_pdf, methods=["GET"])
