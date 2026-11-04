@@ -17,7 +17,7 @@ def env(tmp_path):
     dbmod = importlib.import_module(pkg + ".db")
     routes.view_db = dbmod.DocViewerDB(str(tmp_path / "dv.db"))
     from flask import Flask
-    app = Flask("t"); app.register_blueprint(routes.create_blueprint())
+    app = Flask("t"); app.secret_key = "t"; app.register_blueprint(routes.create_blueprint())
     from backend.tools.lib import artifact_delivery as d
 
     def mint(expires=600, path=FIXTURE):
@@ -76,3 +76,23 @@ def test_export_pdf(env, engine):
     if shutil.which("pdftotext"):
         txt = subprocess.run(["pdftotext", "-", "-"], input=r.data, capture_output=True).stdout.decode()
         assert "Mulai" in txt and "Catatan" in txt
+
+
+def _login(c):
+    with c.session_transaction() as s:
+        s["authenticated"] = True
+
+
+def test_files_requires_auth(env):
+    assert env.c.get("/plugin/doc-viewer/files").status_code == 404
+    assert env.c.get("/plugin/doc-viewer/files/1").status_code == 404
+
+
+def test_files_list_and_detail(env):
+    env.mint()
+    _login(env.c)
+    r = env.c.get("/plugin/doc-viewer/files")
+    assert r.status_code == 200 and b"sample.md" in r.data and b"/plugin/doc-viewer/files/1" in r.data
+    d = env.c.get("/plugin/doc-viewer/files/1")
+    assert d.status_code == 200 and b"Contoh Dokumen" in d.data
+    assert env.c.get("/plugin/doc-viewer/files/999").status_code == 404

@@ -51,6 +51,16 @@ class DocViewerDB:
             r = c.execute("SELECT * FROM doc_viewer_tokens WHERE token_hash=?", (token_hash,)).fetchone()
             return dict(r) if r else None
 
+    def list_all(self, limit=500):
+        with self._connect() as c:
+            rows = c.execute("SELECT id, owner_agent_id, filename, template, created_at, expires_at, revoked_at, view_count FROM doc_viewer_tokens ORDER BY created_at DESC LIMIT ?", (limit,)).fetchall()
+            return [dict(r) for r in rows]
+
+    def get_by_id(self, row_id) -> Optional[Dict[str, Any]]:
+        with self._connect() as c:
+            r = c.execute("SELECT * FROM doc_viewer_tokens WHERE id=?", (row_id,)).fetchone()
+            return dict(r) if r else None
+
     def touch(self, token_hash) -> None:
         with self._connect() as c:
             c.execute("UPDATE doc_viewer_tokens SET view_count=view_count+1 WHERE token_hash=?", (token_hash,))
