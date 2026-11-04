@@ -1,0 +1,17 @@
+{
+  "id": "doc-viewer",
+  "name": "Doc Viewer",
+  "version": "0.1.0",
+  "description": "Token-protected markdown document viewer with themed templates, Pele diagrams, and HTML/PDF export. Adds the share_doc agent tool and the /plugin/doc-viewer/v/<token> endpoints.",
+  "author": "Evonic",
+  "enabled": true,
+  "events": [],
+  "tools_file": "tools.json",
+  "variables": [
+    {"name": "ENABLED", "label": "Enabled", "type": "boolean", "default": true, "description": "Kill switch. When disabled, share_doc and all viewer endpoints fail closed."},
+    {"name": "PUBLIC_BASE_URL", "label": "Public Base URL", "type": "string", "default": "", "description": "Externally reachable origin for viewer URLs, without trailing slash. Falls back to EVONIC_PUBLIC_URL, then http://127.0.0.1:8080."},
+    {"name": "TOKEN_TTL_SECONDS", "label": "Token TTL (seconds)", "type": "number", "default": 604800, "description": "Lifetime of a viewer link. Default 7 days. Links are multi-use until expiry or revocation."},
+    {"name": "DEFAULT_TEMPLATE", "label": "Default template", "type": "string", "default": "paper", "description": "Template used when none is specified: paper, course-dark, or explainer."},
+    {"name": "PDF_ENGINE", "label": "PDF engine", "type": "string", "default": "weasyprint", "description": "weasyprint (default) or chromium. Chromium is also used as automatic fallback when WeasyPrint fails."}
+  ]
+}

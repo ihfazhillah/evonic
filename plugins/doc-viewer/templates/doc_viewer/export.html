@@ -1,0 +1,10 @@
+<!doctype html>
+<html lang="id"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>{{ title }}</title>
+<style>{{ css|safe }}</style>
+</head>
+<body data-template="{{ template }}">
+<main id="doc" class="doc"><noscript><pre>{{ markdown }}</pre></noscript></main>
+<script id="doc-src" type="application/json">{{ markdown|tojson }}</script>
+{% for js in scripts %}<script>{{ js|safe }}</script>
+{% endfor %}</body></html>

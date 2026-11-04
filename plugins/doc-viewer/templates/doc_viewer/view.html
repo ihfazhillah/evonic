@@ -1,0 +1,13 @@
+<!doctype html>
+<html lang="id"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<meta name="robots" content="noindex"><title>{{ title }}</title>
+<link rel="stylesheet" href="{{ url_for('doc_viewer.static', filename='themes/' ~ template ~ '.css') }}">
+</head>
+<body data-template="{{ template }}">
+<main id="doc" class="doc"><noscript><pre>{{ markdown }}</pre></noscript></main>
+<script id="doc-src" type="application/json">{{ markdown|tojson }}</script>
+<script src="{{ url_for('doc_viewer.static', filename='vendor/markdown-it.min.js') }}"></script>
+<script src="{{ url_for('doc_viewer.static', filename='vendor/purify.min.js') }}"></script>
+<script src="{{ url_for('doc_viewer.static', filename='vendor/pele.global.js') }}"></script>
+<script src="{{ url_for('doc_viewer.static', filename='viewer.js') }}"></script>
+</body></html>
