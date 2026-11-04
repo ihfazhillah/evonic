@@ -86,6 +86,7 @@ def _login(c):
 def test_files_requires_auth(env):
     assert env.c.get("/plugin/doc-viewer/files").status_code == 404
     assert env.c.get("/plugin/doc-viewer/files/1").status_code == 404
+    assert env.c.get("/plugin/doc-viewer/files/1/frame").status_code == 404
 
 
 def test_files_list_and_detail(env):
@@ -94,7 +95,9 @@ def test_files_list_and_detail(env):
     r = env.c.get("/plugin/doc-viewer/files")
     assert r.status_code == 200 and b"sample.md" in r.data and b"/plugin/doc-viewer/files/1" in r.data
     d = env.c.get("/plugin/doc-viewer/files/1")
-    assert d.status_code == 200 and b"Contoh Dokumen" in d.data
+    assert d.status_code == 200 and b"/plugin/doc-viewer/files/1/frame" in d.data
+    f = env.c.get("/plugin/doc-viewer/files/1/frame")
+    assert f.status_code == 200 and b"Contoh Dokumen" in f.data and b"evx-nav" not in f.data
     assert env.c.get("/plugin/doc-viewer/files/999").status_code == 404
 
 

@@ -159,9 +159,21 @@ def _file_detail(row_id):
     from flask import make_response, url_for
     nav = {"back": url_for("doc_viewer.files"),
            "html": url_for("doc_viewer.file_export_html", row_id=row_id),
-           "pdf": url_for("doc_viewer.file_export_pdf", row_id=row_id)}
+           "pdf": url_for("doc_viewer.file_export_pdf", row_id=row_id),
+           "frame": url_for("doc_viewer.file_frame", row_id=row_id)}
+    return _secure(make_response(render_template("doc_viewer/detail.html", title=row["filename"], nav=nav)))
+
+
+def _file_frame(row_id):
+    if not _authed():
+        return _not_found()
+    hit = _load_row(row_id)
+    if hit is None:
+        return _not_found()
+    row, md = hit
+    from flask import make_response
     return _secure(make_response(render_template("doc_viewer/view.html", title=row["filename"], markdown=md,
-                                                 template=cfg.template(row.get("template")), token=None, nav=nav)))
+                                                 template=cfg.template(row.get("template")), token=None, nav=None)))
 
 
 def _file_export_html(row_id):
@@ -190,6 +202,7 @@ def create_blueprint() -> Blueprint:
     bp.add_url_rule("/plugin/doc-viewer/", "status", _status, methods=["GET"])
     bp.add_url_rule("/plugin/doc-viewer/files", "files", _files, methods=["GET"])
     bp.add_url_rule("/plugin/doc-viewer/files/<int:row_id>", "file_detail", _file_detail, methods=["GET"])
+    bp.add_url_rule("/plugin/doc-viewer/files/<int:row_id>/frame", "file_frame", _file_frame, methods=["GET"])
     bp.add_url_rule("/plugin/doc-viewer/files/<int:row_id>/export.html", "file_export_html", _file_export_html, methods=["GET"])
     bp.add_url_rule("/plugin/doc-viewer/files/<int:row_id>/export.pdf", "file_export_pdf", _file_export_pdf, methods=["GET"])
     bp.add_url_rule("/plugin/doc-viewer/v/<token>", "view", _view, methods=["GET"])

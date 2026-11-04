@@ -1,16 +1,38 @@
-<!doctype html>
-<html lang="id"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
-<meta name="robots" content="noindex"><title>Doc Viewer: Files</title>
+{% extends "base.html" %}
+{% block content %}
 <style>
-body{font:15px/1.5 system-ui,sans-serif;margin:2rem auto;max-width:960px;padding:0 1rem;color:#222}
-h1{font-size:1.4rem}table{width:100%;border-collapse:collapse}
-th,td{text-align:left;padding:.45rem .6rem;border-bottom:1px solid #e5e5e5}th{background:#f6f6f6;font-weight:600}
-a{color:#0b5fff;text-decoration:none}a:hover{text-decoration:underline}
-.s{font-size:.8rem;padding:.1rem .45rem;border-radius:4px;background:#eee}.s.active{background:#dff5e3;color:#16642b}.s.expired,.s.revoked{color:#888}
-.m{color:#777;font-size:.85rem}
-</style></head><body>
-<h1>Registered Files <span class="m">({{ rows|length }})</span></h1>
-{% if rows %}<table><thead><tr><th>File</th><th>Agent</th><th>Template</th><th>Status</th><th>Created</th><th>Expires</th><th>Views</th></tr></thead><tbody>
-{% for r in rows %}<tr><td><a href="{{ url_for('doc_viewer.file_detail', row_id=r.id) }}">{{ r.filename }}</a></td><td>{{ r.owner_agent_id }}</td><td>{{ r.template }}</td><td><span class="s {{ r.status }}">{{ r.status }}</span></td><td class="m">{{ r.created }}</td><td class="m">{{ r.expires }}</td><td>{{ r.view_count }}</td></tr>
-{% endfor %}</tbody></table>{% else %}<p class="m">Belum ada file terdaftar.</p>{% endif %}
-</body></html>
+.dv-status{display:inline-flex;align-items:center;font-size:.75rem;font-weight:600;line-height:1;padding:.25rem .5rem;border-radius:9999px}
+</style>
+<div class="px-6 pt-5 pb-8">
+  <div class="flex items-center justify-between mb-4">
+    <div>
+      <h1 class="text-xl font-semibold text-gray-900 dark:text-gray-100">Docs</h1>
+      <p class="text-sm text-gray-500 dark:text-gray-400">Registered files ({{ rows|length }})</p>
+    </div>
+  </div>
+  {% if rows %}
+  <div class="bg-white dark:bg-gray-800 rounded-lg border border-gray-200 dark:border-gray-600 overflow-x-auto">
+    <table class="w-full text-sm">
+      <thead class="bg-gray-50 dark:bg-gray-900/40 text-left text-gray-600 dark:text-gray-300">
+        <tr>{% for h in ['File','Agent','Template','Status','Created','Expires','Views'] %}<th class="px-4 py-2.5 font-semibold">{{ h }}</th>{% endfor %}</tr>
+      </thead>
+      <tbody class="divide-y divide-gray-200 dark:divide-gray-700 text-gray-800 dark:text-gray-200">
+      {% for r in rows %}
+        <tr class="hover:bg-gray-50 dark:hover:bg-gray-700/40">
+          <td class="px-4 py-2.5"><a class="font-medium text-indigo-600 dark:text-indigo-400 hover:underline" href="{{ url_for('doc_viewer.file_detail', row_id=r.id) }}">{{ r.filename }}</a></td>
+          <td class="px-4 py-2.5">{{ r.owner_agent_id }}</td>
+          <td class="px-4 py-2.5">{{ r.template }}</td>
+          <td class="px-4 py-2.5">{% if r.status == 'active' %}<span class="dv-status bg-green-100 text-green-700 dark:bg-green-900/40 dark:text-green-300">active</span>{% else %}<span class="dv-status bg-gray-100 text-gray-500 dark:bg-gray-700 dark:text-gray-400">{{ r.status }}</span>{% endif %}</td>
+          <td class="px-4 py-2.5 text-gray-500 dark:text-gray-400">{{ r.created }}</td>
+          <td class="px-4 py-2.5 text-gray-500 dark:text-gray-400">{{ r.expires }}</td>
+          <td class="px-4 py-2.5">{{ r.view_count }}</td>
+        </tr>
+      {% endfor %}
+      </tbody>
+    </table>
+  </div>
+  {% else %}
+  <div class="bg-white dark:bg-gray-800 rounded-lg border border-gray-200 dark:border-gray-600 p-6 text-sm text-gray-500 dark:text-gray-400">Belum ada file terdaftar.</div>
+  {% endif %}
+</div>
+{% endblock %}
