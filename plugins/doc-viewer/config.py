@@ -29,8 +29,21 @@ def ttl() -> int:
 
 
 def base_url() -> str:
-    v = var("PUBLIC_BASE_URL") or os.environ.get("EVONIC_PUBLIC_URL") or "http://127.0.0.1:8080"
+    v = var("PUBLIC_BASE_URL") or _evonic_base_url()
     return str(v).rstrip("/")
+
+
+def _evonic_base_url() -> str:
+    """Follow Evonic's root config: EVONIC_PUBLIC_URL, then http://127.0.0.1:<PORT>."""
+    try:
+        import importlib
+        root = importlib.import_module("config")  # Evonic root config.py
+        pub = getattr(root, "EVONIC_PUBLIC_URL", "") or ""
+        port = getattr(root, "PORT", None)
+    except Exception:
+        pub, port = "", None
+    pub = pub or os.environ.get("EVONIC_PUBLIC_URL", "").strip()
+    return pub or f"http://127.0.0.1:{port or os.environ.get('PORT') or 8080}"
 
 
 def template(name=None) -> str:
