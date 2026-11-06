@@ -346,8 +346,8 @@ class TestFilterPipeline:
 
     def test_exit_code_non_zero_passes_through(self):
         flt = self.make_filter(strip_lines=[re.compile(r".")])
-        result = pipeline_compress("important data", flt, exit_code=1)
-        assert result == "important data"
+        result = pipeline_compress("noise\nValueError: important data", flt, exit_code=1)
+        assert "ValueError: important data" in result  # task #1: error lines preserved
 
     # ------------------------------------------------------------------
     # fail-open: exception in pipeline returns original
@@ -498,9 +498,9 @@ class TestCompressorRegistry:
         reg._filters = load_filters(project_dir=str(tmp_path))
         reg._loaded = True
         reg._build_cache()
-        output = "important error output\n"
+        output = "noise\nError: important error output\n"
         result = reg.compress("anything", 1, output)
-        assert result == output
+        assert "Error: important error output" in result  # task #1
 
     def test_compress_no_matching_filter_passthrough(self, tmp_path):
         """compress() with no matching filter returns output unchanged."""

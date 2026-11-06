@@ -165,7 +165,7 @@ class TestE2EErrorPassthrough:
         """Registry compress() skips filtering when exit_code != 0."""
         error = _error_output()
         result = get_registry().compress("git status", 1, error)
-        assert result == error, "Error output must pass through unchanged"
+        assert error.strip() in result, "task #1: error lines preserved"
 
     def test_pipeline_exit_code_nonzero_passthrough(self):
         """filter_pipeline.compress() also guards on exit_code."""
@@ -177,7 +177,7 @@ class TestE2EErrorPassthrough:
         )
         error = _error_output()
         result = pipeline_compress(error, flt, exit_code=1)
-        assert result == error
+        assert error.strip() in result  # task #1: error lines preserved
 
     def test_json_error_passthrough(self):
         """JSON-serialized error results also pass through."""
@@ -346,7 +346,7 @@ class TestRTKNoCompress:
         # verified manually.  Here we test the exit_code guard path instead,
         # which achieves the same effect: outputs pass through unchanged.
         result_guard = get_registry().compress("git status", 1, raw)
-        assert result_guard == raw, "exit_code != 0 always passes through"
+        assert "On branch" not in result_guard, "task #1: non-zero exit is compressed too"
 
         # 3. Also test: custom registry with no filters -> no compression
         reg = CompressorRegistry(project_root="/nonexistent")
@@ -359,7 +359,7 @@ class TestRTKNoCompress:
         """Error outputs always pass through (exit_code guard fires first)."""
         error = _error_output()
         result = get_registry().compress("git status", 1, error)
-        assert result == error
+        assert error.strip() in result  # task #1: error lines preserved
 
     def test_no_compress_zero_allows_compression(self, monkeypatch):
         """Default (no env var) -> compression is active."""

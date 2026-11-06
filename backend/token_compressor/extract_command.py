@@ -46,33 +46,46 @@ def extract_command(tool_name: str, params: dict[str, Any]) -> str:
     return tool_name
 
 
-def _bash_cmd(script: str) -> str:
-    """Extract the last substantive command from a bash script."""
-    if not script:
+_SPLIT_RE = re.compile(r"\n|;|&&|\|\||\|")
+_META_WORDS = {"cd", "export", "set", "source", ".", "trap", "exec", "echo", "pushd", "popd", "unset", "true", "false"}
+
+
+def _bash_candidates(script: str) -> list[str]:
+    """Split a script into substantive command segments (task #1, step 2)."""
+    out: list[str] = []
+    for seg in _SPLIT_RE.split(script or ""):
+        seg = seg.strip().lstrip("({").strip()
+        if not seg or seg.startswith("#"):
+            continue
+        seg = re.sub(r"^(?:\w+=\S*\s*)+", "", seg).strip()
+        if not seg:
+            continue
+        tokens = seg.split()
+        if tokens[0] in _META_WORDS:
+            continue
+        out.append(" ".join(tokens[:2]) if len(tokens) >= 2 else tokens[0])
+    return out
+
+
+def _bash_cmd(script: str, matcher=None) -> str:
+    """Return the first candidate segment that matches a filter, else the last candidate."""
+    cands = _bash_candidates(script)
+    if not cands:
         return "bash"
-
-    lines = [l.strip() for l in script.split("\n")]
-    candidates: list[str] = []
-
-    for line in reversed(lines):
-        if not line:
-            continue
-        if line.startswith("#") or line.startswith("#!/"):
-            continue
-        if line.startswith(_META_PREFIXES):
-            continue
-        candidates.insert(0, line)
-
-    if not candidates:
-        return "bash"
-
-    cmd = candidates[-1]
-    cmd = re.sub(r"^\s*(?:\w+=[^\s]+\s+)+", "", cmd)
-    base = re.split(r"[|;&<>]", cmd)[0].strip()
-    tokens = base.split()
-    if len(tokens) >= 2:
-        return " ".join(tokens[:2])
-    return tokens[0] if tokens else "bash"
+    if matcher is None:
+        try:
+            from .compressor_registry import get_registry
+            matcher = get_registry().lookup
+        except Exception:
+            matcher = None
+    if matcher is not None:
+        for c in cands:
+            try:
+                if matcher(c) is not None:
+                    return c
+            except Exception:
+                break
+    return cands[-1]
 
 
 def _py_cmd(code: str) -> str:

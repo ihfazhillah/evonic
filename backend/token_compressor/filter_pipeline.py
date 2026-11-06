@@ -53,14 +53,12 @@ def compress(
     # ------------------------------------------------------------------
     # Guard: never compress error outputs
     # ------------------------------------------------------------------
-    if exit_code != 0:
-        return output
-
-    # ------------------------------------------------------------------
-    # Fail-open: any exception returns the original output
-    # ------------------------------------------------------------------
+    # Non-zero exit: compress but always preserve error/traceback lines (task #1, step 5).
     try:
-        return _run_pipeline(output, flt)
+        result = _run_pipeline(output, flt)
+        if exit_code != 0:
+            result = _preserve_error_lines(output, result)
+        return result
     except Exception:
         logger.exception(
             "filter_pipeline.compress: unhandled exception — "
@@ -250,3 +248,41 @@ def _stage_max_lines(text: str, flt: CompiledFilter) -> str:
     result.extend(tail_part)
 
     return "\n".join(result)
+
+
+_ERROR_LINE_RE = re.compile(
+    r"(Traceback \(most recent call last\)|\b\w*(Error|Exception)\b|\bFAILED\b|\bFAIL\b|\bfatal\b|\berror\b|^\s+File \"|^E\s)",
+    re.IGNORECASE,
+)
+
+
+def _preserve_error_lines(original: str, compressed: str) -> str:
+    """Append any error/traceback lines from *original* missing in *compressed*."""
+    present = set(compressed.split("\n"))
+    missing = [l for l in original.split("\n") if _ERROR_LINE_RE.search(l) and l not in present]
+    if not missing:
+        return compressed
+    return compressed + "\n...[preserved error lines]...\n" + "\n".join(missing)
+
+
+def fallback_compress(output: str, exit_code: int = 0, head: int = 60, tail: int = 40) -> str:
+    """Generic fallback (task #1, step 4): strip ANSI, collapse blank/duplicate
+    consecutive lines, keep head+tail with an omitted-lines marker."""
+    try:
+        text = _ANSI_RE.sub("", output)
+        out: list[str] = []
+        prev = None
+        for line in text.split("\n"):
+            if line == prev and (not line.strip() or out):
+                continue
+            out.append(line)
+            prev = line
+        if len(out) > head + tail + 1:
+            out = out[:head] + [f"...[{len(out) - head - tail} lines omitted]..."] + out[-tail:]
+        result = "\n".join(out)
+        if exit_code != 0:
+            result = _preserve_error_lines(output, result)
+        return result
+    except Exception:
+        logger.exception("fallback_compress failed (fail-open)")
+        return output

@@ -2907,7 +2907,22 @@ def run_tool_loop(agent: Dict[str, Any],
             _rtk_failed = False
             try:
                 _cmd = _extract_command(fn_name, args)
-                compressed_str = _get_rtk_registry().compress(_cmd, _exit_code, result_str)
+                if isinstance(tool_result, dict):
+                    # Compress raw string fields BEFORE serialization so line-based
+                    # filters see real newlines (task #1, root cause 1).
+                    _reg = _get_rtk_registry()
+                    _compressed_dict = dict(tool_result)
+                    for _fk in ('stdout', 'stderr', 'result', 'content'):
+                        _fv = _compressed_dict.get(_fk)
+                        if isinstance(_fv, str) and _fv:
+                            _compressed_dict[_fk] = _reg.compress(_cmd, _exit_code, _fv)
+                    try:
+                        compressed_str = json.dumps(_compressed_dict)
+                    except (TypeError, ValueError):
+                        compressed_str = str(_compressed_dict)
+                else:
+                    _raw = tool_result if isinstance(tool_result, str) else result_str
+                    compressed_str = _get_rtk_registry().compress(_cmd, _exit_code, _raw)
             except Exception:
                 _logger.warning("RTK compression failed for %r — falling back to truncation", fn_name, exc_info=True)
                 _rtk_failed = True

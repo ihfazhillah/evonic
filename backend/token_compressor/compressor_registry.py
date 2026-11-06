@@ -277,10 +277,6 @@ class CompressorRegistry:
             Compressed text, or original output if no filter matched or
             on failure.
         """
-        # --- Exit code guard ---
-        if exit_code != 0:
-            return output
-
         # --- Global disable via RTK_NO_COMPRESS env var ---
         if not TOOL_COMPRESSION_ENABLED:
             return output
@@ -292,8 +288,9 @@ class CompressorRegistry:
             filt = self.lookup(command_str)
             if filt is None:
                 if verbose:
-                    logger.debug("RTK: no filter for command %r", command_str)
-                return output
+                    logger.debug("RTK: no filter for %r, using generic fallback", command_str)
+                from .filter_pipeline import fallback_compress
+                return fallback_compress(output, exit_code)
 
             # --- Token counting (approximate, via tiktoken) ---
             pre_tokens = _count_tokens(output)
