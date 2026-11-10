@@ -6,9 +6,16 @@ Claude Code client itself talks to Anthropic. The CLI runs here as a plain LLM:
 its built-in tools, settings, MCP servers and session persistence are disabled,
 and Evonic's own tools are emulated through ``--json-schema`` so the agent loop,
 workplaces and safety checks in Evonic stay in charge of every action.
+
+The module is an adapter: Evonic's rules apply on the way out (OpenAI-shaped
+messages, honest ``tool_calls``/``finish_reason``), Claude's rules apply on the
+way in. The history goes to the CLI as one content block per message so the
+prompt cache keeps matching the unchanged prefix between calls; a single
+growing text block would be re-written from scratch on every step.
 """
 
 import json
+import logging
 import os
 import re
 import shutil
@@ -32,10 +39,13 @@ KNOWN_MODELS = [
     {"id": "claude-haiku-5-5", "name": "Claude Haiku 5.5"},
 ]
 
+_logger = logging.getLogger(__name__)
+
 _OUTPUT_SCHEMA = {
     "type": "object",
     "properties": {
         "text": {"type": "string"},
+        "done": {"type": "boolean"},
         "tool_calls": {
             "type": "array",
             "items": {
@@ -48,8 +58,22 @@ _OUTPUT_SCHEMA = {
             },
         },
     },
-    "required": ["text"],
+    "required": ["text", "done"],
 }
+
+# The structured-output channel itself is a synthetic tool inside the CLI.
+_STRUCTURED_OUTPUT_TOOL = "StructuredOutput"
+
+# Line appended by ``build_system_prompt`` when ``inject_datetime`` is on
+# (``context.DATETIME_LINE_PREFIX``). It changes every turn, so it is moved
+# out of the system prompt, which must stay byte-stable to be cached.
+_DATETIME_LINE = re.compile(r"\n*^Current date/time: [^\n]*", re.MULTILINE)
+
+_NUDGE = (
+    "[evonic]\nYour last reply set done=false but contained no tool_calls, so nothing "
+    "was executed and your turn would end here. Reply again now with the tool_calls "
+    "for your next step. Set done=true only if the task is finished or you need "
+    "input from the user. Do not repeat the plan.")
 
 # Same child-env policy as pi-claude-bridge: no claude.ai cloud MCP discovery,
 # and Evonic owns context management so the CLI must not auto-compact.
@@ -178,16 +202,71 @@ def _image_block(part: Dict[str, Any]) -> Optional[Dict[str, Any]]:
         "type": "base64", "media_type": match.group(1), "data": match.group(2)}}
 
 
-def _format_transcript(messages: List[Dict[str, Any]],
-                       images: Optional[List[Dict[str, Any]]] = None) -> str:
-    """Flatten OpenAI-style messages (incl. tool calls/results) into a transcript."""
-    blocks = []
-    for message in messages:
+def _text_block(text: str) -> Dict[str, Any]:
+    return {"type": "text", "text": text}
+
+
+def _split_system(messages: List[Dict[str, Any]]):
+    """Split messages into ``(system_prompt, context_parts, history)``.
+
+    Only the first system message becomes the CLI system prompt. The other
+    leading system messages (agent state, skill context) are rewritten by the
+    agent loop between iterations; at the front of the prompt each rewrite
+    would invalidate the cache for the whole history, so they travel as
+    context next to the latest user message instead. System messages inside
+    the history stay where they are.
+    """
+    system_prompt = ""
+    context: List[str] = []
+    index = 0
+    while index < len(messages) and messages[index].get("role") == "system":
+        text = _content_text(messages[index].get("content"))
+        if index == 0:
+            system_prompt = text
+        elif text:
+            context.append(text)
+        index += 1
+
+    stamps = [m.group(0).strip() for m in _DATETIME_LINE.finditer(system_prompt)]
+    if stamps:
+        system_prompt = _DATETIME_LINE.sub("", system_prompt)
+        context = stamps + context
+    return system_prompt, context, messages[index:]
+
+
+def _history_blocks(history: List[Dict[str, Any]], context: List[str]) -> List[Dict[str, Any]]:
+    """One content block per message; consecutive tool results share one block.
+
+    Blocks for older messages must come out byte-identical on every call; the
+    cache only hits on an unchanged prefix of whole blocks. Volatile context is
+    placed right after the latest user message: it then only moves when a new
+    user message arrives, not on every tool step.
+    """
+    anchor = max((i for i, m in enumerate(history) if m.get("role") == "user"), default=None)
+    context_block = _text_block("[context]\n" + "\n\n".join(context)) if context else None
+    blocks: List[Dict[str, Any]] = [context_block] if context_block and anchor is None else []
+    images: List[Dict[str, Any]] = []
+    tool_results: List[str] = []
+
+    def flush_tool_results():
+        if tool_results:
+            blocks.append(_text_block("\n\n".join(tool_results)))
+            tool_results.clear()
+
+    for index, message in enumerate(history):
         role = message.get("role")
-        text = _content_text(message.get("content"), images)
+        if role == "tool":
+            text = _content_text(message.get("content"))
+            tool_results.append(f"[tool_result id={message.get('tool_call_id', '')}]\n{text}")
+            continue
+        flush_tool_results()
         if role == "user":
-            blocks.append(f"[user]\n{text}")
+            first_image = len(images)
+            text = _content_text(message.get("content"), images)
+            blocks.extend(images[first_image:])
+            blocks.append(_text_block(f"[user]\n{text}"))
         elif role == "assistant":
+            text = _content_text(message.get("content"))
             lines = [f"[assistant]\n{text}"] if text else []
             for call in message.get("tool_calls") or []:
                 fn = call.get("function", {})
@@ -195,10 +274,13 @@ def _format_transcript(messages: List[Dict[str, Any]],
                     f"[assistant tool_call id={call.get('id', '')} name={fn.get('name', '')}]\n"
                     f"{fn.get('arguments', '{}')}")
             if lines:
-                blocks.append("\n".join(lines))
-        elif role == "tool":
-            blocks.append(f"[tool_result id={message.get('tool_call_id', '')}]\n{text}")
-    return "\n\n".join(blocks)
+                blocks.append(_text_block("\n".join(lines)))
+        elif role == "system":
+            blocks.append(_text_block(f"[system]\n{_content_text(message.get('content'))}"))
+        if index == anchor and context_block:
+            blocks.append(context_block)
+    flush_tool_results()
+    return blocks or [_text_block("[user]\n(empty)")]
 
 
 def _tool_instructions(tools: List[Dict[str, Any]], tool_choice: Optional[str]) -> str:
@@ -219,22 +301,43 @@ def _tool_instructions(tools: List[Dict[str, Any]], tool_choice: Optional[str]) 
         "never invoke them as native tool calls (that fails with 'No such tool "
         "available'). Instead you call them by writing them into your final structured "
         "reply, a JSON object with `text` (what you say to the user, may be empty when "
-        "calling tools) and `tool_calls` (list of {name, arguments}). Evonic executes "
-        "every entry in `tool_calls` and the conversation continues with [tool_result] "
-        "entries. `arguments` must follow the tool's JSON schema. You have no other "
-        f"tools. {rule}\n\n{json.dumps(specs, ensure_ascii=False)}")
+        "calling tools), `tool_calls` (list of {name, arguments}) and `done`. Evonic "
+        "executes every entry in `tool_calls` and the conversation continues with "
+        "[tool_result] entries. `arguments` must follow the tool's JSON schema. You have "
+        "no other tools.\n"
+        "A reply without tool_calls ends your turn. If you are about to do something, "
+        "put its tool_calls in this same reply instead of describing the plan. Set "
+        "`done` to true only when the task is finished or you need input from the "
+        "user; when `done` is false, tool_calls must not be empty. "
+        f"{rule}\n\n{json.dumps(specs, ensure_ascii=False)}")
 
 
-def _final_result(stdout: str) -> Dict[str, Any]:
-    """Pick the ``result`` event out of ``--output-format stream-json`` output."""
-    for line in reversed((stdout or "").splitlines()):
+def _parse_events(stdout: str):
+    """Return ``(result_event, native_tool_attempts)`` from stream-json output.
+
+    Native tool attempts are tool_use blocks the model sent inside the CLI's
+    own loop (they fail there with 'No such tool available'). Evonic never sees
+    them otherwise, so they are surfaced for logging.
+    """
+    result = None
+    attempts: List[str] = []
+    for line in (stdout or "").splitlines():
         try:
             event = json.loads(line)
         except json.JSONDecodeError:
             continue
-        if isinstance(event, dict) and event.get("type") == "result":
-            return event
-    raise json.JSONDecodeError("no result event", stdout or "", 0)
+        if not isinstance(event, dict):
+            continue
+        if event.get("type") == "result":
+            result = event
+        elif event.get("type") == "assistant":
+            for block in (event.get("message") or {}).get("content") or []:
+                if (isinstance(block, dict) and block.get("type") == "tool_use"
+                        and block.get("name") != _STRUCTURED_OUTPUT_TOOL):
+                    attempts.append(str(block.get("name") or ""))
+    if result is None:
+        raise json.JSONDecodeError("no result event", stdout or "", 0)
+    return result, attempts
 
 
 def _classify_error(text: str) -> str:
@@ -255,6 +358,70 @@ def _fail(error_type: str, detail: str, duration_ms: int) -> Dict[str, Any]:
             "duration_ms": duration_ms}
 
 
+def _run_cli(cmd: List[str], blocks: List[Dict[str, Any]], timeout: int):
+    """Run one CLI call. Returns ``(result_event, native_attempts, None)`` or ``(None, None, failure)``."""
+    start = time.time()
+    payload = json.dumps({"type": "user", "message": {"role": "user", "content": blocks}},
+                         ensure_ascii=False) + "\n"
+    try:
+        proc = subprocess.run(
+            cmd, input=payload, capture_output=True, text=True,
+            timeout=timeout, cwd=_neutral_cwd(), env={**os.environ, **CHILD_ENV})
+    except subprocess.TimeoutExpired:
+        return None, None, _fail("timeout_error", "claude -p timed out",
+                                 int((time.time() - start) * 1000))
+    except OSError as exc:
+        return None, None, _fail("connection_error", str(exc), int((time.time() - start) * 1000))
+
+    duration_ms = int((time.time() - start) * 1000)
+    try:
+        data, attempts = _parse_events(proc.stdout)
+    except (json.JSONDecodeError, TypeError):
+        detail = (proc.stderr or proc.stdout or "empty output").strip()[:500]
+        return None, None, _fail(_classify_error(detail), detail, duration_ms)
+
+    if data.get("is_error") or proc.returncode != 0:
+        detail = str(data.get("result") or proc.stderr or "claude -p failed")[:500]
+        error_type = "rate_limit_error" if data.get("api_error_status") == 429 else _classify_error(detail)
+        return None, None, _fail(error_type, detail, duration_ms)
+    data["_duration_ms"] = duration_ms
+    return data, attempts, None
+
+
+def _structured_reply(data: Dict[str, Any]) -> Dict[str, Any]:
+    structured = data.get("structured_output")
+    if isinstance(structured, dict):
+        return structured
+    text = data.get("result") or ""
+    try:
+        parsed = json.loads(text)
+    except (json.JSONDecodeError, TypeError):
+        parsed = None
+    return parsed if isinstance(parsed, dict) else {"text": text}
+
+
+def _tool_calls(structured: Dict[str, Any]) -> List[Dict[str, Any]]:
+    """Every named call is handed to Evonic, known or not.
+
+    Unknown names are not dropped here: Evonic's quality monitor answers them
+    with a correction listing the real tools, so the model can recover instead
+    of its turn silently ending.
+    """
+    calls = []
+    for call in structured.get("tool_calls") or []:
+        if not isinstance(call, dict) or not call.get("name"):
+            continue
+        arguments = call.get("arguments")
+        if not isinstance(arguments, str):
+            arguments = json.dumps(arguments or {}, ensure_ascii=False)
+        calls.append({
+            "id": f"call_{uuid.uuid4().hex[:24]}",
+            "type": "function",
+            "function": {"name": str(call["name"]), "arguments": arguments},
+        })
+    return calls
+
+
 def send_request(
     model: str,
     messages: List[Dict[str, Any]],
@@ -265,90 +432,70 @@ def send_request(
     timeout: Optional[int] = None,
 ) -> Dict[str, Any]:
     """Run one completion. Returns ``{success, response}`` in OpenAI chat shape."""
-    start = time.time()
     binary = claude_binary()
     if not binary:
         return _fail("connection_error", get_status()["error"], 0)
 
-    system_parts = [_content_text(m.get("content")) for m in messages if m.get("role") == "system"]
-    system_prompt = "\n\n".join(p for p in system_parts if p) or "You are a helpful assistant."
+    system_prompt, context, history = _split_system(messages)
+    system_prompt = system_prompt or "You are a helpful assistant."
     if tools:
         system_prompt += _tool_instructions(tools, tool_choice)
-    images: List[Dict[str, Any]] = []
-    transcript = _format_transcript([m for m in messages if m.get("role") != "system"], images)
+    blocks = _history_blocks(history, context)
 
     cmd = [
-        binary, "-p", "--model", model, "--output-format", "json",
+        binary, "-p", "--model", model,
+        "--input-format", "stream-json", "--output-format", "stream-json", "--verbose",
         "--tools", "", "--no-session-persistence", "--disable-slash-commands",
         "--setting-sources", "", "--strict-mcp-config",
     ]
     cmd += ["--effort", resolve_effort(thinking, thinking_budget)]
     if tools:
         cmd += ["--json-schema", json.dumps(_OUTPUT_SCHEMA)]
-
-    stdin_text = transcript or "[user]\n(empty)"
     if len(system_prompt.encode("utf-8")) <= MAX_ARGV_SYSTEM_PROMPT:
         cmd += ["--system-prompt", system_prompt]
     else:
         cmd += ["--system-prompt", "Follow the instructions in the <system> block of the input."]
-        stdin_text = f"<system>\n{system_prompt}\n</system>\n\n{stdin_text}"
+        blocks = [_text_block(f"<system>\n{system_prompt}\n</system>")] + blocks
 
-    if images:
-        # Plain-text stdin cannot carry images; stream-json input can.
-        cmd += ["--input-format", "stream-json", "--verbose"]
-        cmd[cmd.index("--output-format") + 1] = "stream-json"
-        stdin_text = json.dumps({"type": "user", "message": {"role": "user", "content": [
-            *images, {"type": "text", "text": stdin_text}]}}) + "\n"
-
-    try:
-        proc = subprocess.run(
-            cmd, input=stdin_text, capture_output=True, text=True,
-            timeout=timeout or DEFAULT_TIMEOUT, cwd=_neutral_cwd(),
-            env={**os.environ, **CHILD_ENV})
-    except subprocess.TimeoutExpired:
-        return _fail("timeout_error", "claude -p timed out", int((time.time() - start) * 1000))
-    except OSError as exc:
-        return _fail("connection_error", str(exc), int((time.time() - start) * 1000))
-
-    duration_ms = int((time.time() - start) * 1000)
-    try:
-        data = _final_result(proc.stdout) if images else json.loads(proc.stdout)
-    except (json.JSONDecodeError, TypeError):
-        detail = (proc.stderr or proc.stdout or "empty output").strip()[:500]
-        return _fail(_classify_error(detail), detail, duration_ms)
-
-    if data.get("is_error") or proc.returncode != 0:
-        detail = str(data.get("result") or proc.stderr or "claude -p failed")[:500]
-        error_type = "rate_limit_error" if data.get("api_error_status") == 429 else _classify_error(detail)
-        return _fail(error_type, detail, duration_ms)
+    timeout = timeout or DEFAULT_TIMEOUT
+    data, attempts, failure = _run_cli(cmd, blocks, timeout)
+    if failure:
+        return failure
+    runs = [data]
+    native_attempts = list(attempts)
 
     text = data.get("result") or ""
-    tool_calls = []
+    tool_calls: List[Dict[str, Any]] = []
     if tools:
-        structured = data.get("structured_output")
-        if not isinstance(structured, dict):
-            try:
-                structured = json.loads(text)
-            except (json.JSONDecodeError, TypeError):
-                structured = {"text": text}
+        structured = _structured_reply(data)
         text = structured.get("text") or ""
-        known = {t.get("function", {}).get("name") for t in tools}
-        for call in structured.get("tool_calls") or []:
-            if call.get("name") in known:
-                tool_calls.append({
-                    "id": f"call_{uuid.uuid4().hex[:24]}",
-                    "type": "function",
-                    "function": {
-                        "name": call["name"],
-                        "arguments": json.dumps(call.get("arguments") or {}, ensure_ascii=False),
-                    },
-                })
+        tool_calls = _tool_calls(structured)
+        if not tool_calls and structured.get("done") is False:
+            # The model announced work without emitting it. Ask once more on the
+            # same (cached) prefix instead of letting the turn end on a plan.
+            draft = _text_block(f"[assistant draft, not executed]\n{text}")
+            retry, attempts, failure = _run_cli(cmd, blocks + [draft, _text_block(_NUDGE)], timeout)
+            if not failure:
+                runs.append(retry)
+                native_attempts += attempts
+                structured = _structured_reply(retry)
+                text = structured.get("text") or text
+                tool_calls = _tool_calls(structured)
+            _logger.warning("claude_cli: done=false without tool_calls; retried (%s tool_calls after retry)",
+                            len(tool_calls))
+    if native_attempts:
+        _logger.warning("claude_cli: model tried native tool calls inside the CLI: %s",
+                        ", ".join(native_attempts))
 
-    usage = data.get("usage") or {}
-    cached = usage.get("cache_read_input_tokens", 0) or 0
-    prompt_tokens = (usage.get("input_tokens", 0) or 0) + cached + (
-        usage.get("cache_creation_input_tokens", 0) or 0)
-    completion_tokens = usage.get("output_tokens", 0) or 0
+    usage: Dict[str, int] = {}
+    for run in runs:
+        for key, value in (run.get("usage") or {}).items():
+            if isinstance(value, int):
+                usage[key] = usage.get(key, 0) + value
+    cache_read = usage.get("cache_read_input_tokens", 0)
+    cache_write = usage.get("cache_creation_input_tokens", 0)
+    prompt_tokens = usage.get("input_tokens", 0) + cache_read + cache_write
+    completion_tokens = usage.get("output_tokens", 0)
     message: Dict[str, Any] = {"role": "assistant", "content": text}
     if tool_calls:
         message["tool_calls"] = tool_calls
@@ -365,8 +512,14 @@ def send_request(
                 "prompt_tokens": prompt_tokens,
                 "completion_tokens": completion_tokens,
                 "total_tokens": prompt_tokens + completion_tokens,
-                "prompt_tokens_details": {"cached_tokens": cached},
+                "prompt_tokens_details": {"cached_tokens": cache_read,
+                                          "cache_write_tokens": cache_write},
             },
         },
-        "duration_ms": duration_ms,
+        "duration_ms": sum(run.get("_duration_ms", 0) for run in runs),
+        "diagnostics": {
+            "cli_calls": len(runs),
+            "num_turns": sum(run.get("num_turns") or 0 for run in runs),
+            "native_tool_attempts": native_attempts,
+        },
     }

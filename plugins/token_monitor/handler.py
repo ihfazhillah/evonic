@@ -32,6 +32,7 @@ def on_llm_usage(event, sdk):
             duration_ms=int(event.get('duration_ms', 0) or 0),
             provider=event.get('provider') or None,
             cached_tokens=int(event.get('cached_tokens', 0) or 0),
+            cache_write_tokens=int(event.get('cache_write_tokens', 0) or 0),
             reasoning_tokens=int(event.get('reasoning_tokens', 0) or 0),
             usage_details_available=bool(event.get('usage_details_available', False)),
         )

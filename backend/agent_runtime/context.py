@@ -18,6 +18,11 @@ import tiktoken
 
 _logger = logging.getLogger(__name__)
 
+# Prefix of the datetime line appended when ``inject_datetime`` is on. The Claude
+# CLI adapter (backend/provider/claude_cli.py) moves this line out of the system
+# prompt to keep the prompt cache stable, so keep the two in sync.
+DATETIME_LINE_PREFIX = "Current date/time: "
+
 _TIKTOKEN_ENCODING = None
 
 
@@ -681,7 +686,7 @@ def build_system_prompt(agent: Dict[str, Any], injected_system_vars: Dict[str, s
         prompt = prompt.replace('{{day}}', now.strftime('%A'))
         # Auto-append datetime block if no inline template vars were present
         if not has_template_vars:
-            prompt += (f"\n\nCurrent date/time: {now.strftime('%A')}, "
+            prompt += (f"\n\n{DATETIME_LINE_PREFIX}{now.strftime('%A')}, "
                        f"{now.strftime('%Y-%m-%d')}, {now.strftime('%H:%M:%S')} (WIB/UTC+7)")
 
     # Run-as-user awareness: tell agent which user they execute as (no sudo needed).

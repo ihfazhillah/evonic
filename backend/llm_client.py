@@ -778,6 +778,7 @@ class LLMClient:
             completion_tokens=usage["completion_tokens"],
             total_tokens=usage["total_tokens"],
             cached_tokens=usage["prompt_tokens_details"]["cached_tokens"],
+            cache_write_tokens=usage["prompt_tokens_details"].get("cache_write_tokens", 0),
             reasoning_tokens=0,
             usage_details_available=True,
             duration_ms=duration_ms,
