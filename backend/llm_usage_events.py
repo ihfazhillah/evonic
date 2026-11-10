@@ -51,6 +51,11 @@ def usage_context(source: str,
         _usage_ctx.reset(token)
 
 
+def current_usage_context() -> Dict[str, Any]:
+    """The annotation of the LLM call in flight (``{}`` when none is set)."""
+    return dict(_usage_ctx.get() or {})
+
+
 # ── tiktoken token counter (reuses the cl100k_base pattern used elsewhere) ──
 _tiktoken_enc = None
 

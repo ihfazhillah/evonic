@@ -4,7 +4,17 @@ import json
 import subprocess
 from unittest.mock import patch
 
+import pytest
+
+from backend.llm_usage_events import usage_context
 from backend.provider import claude_cli
+
+
+@pytest.fixture(autouse=True)
+def _fresh_conversations():
+    claude_cli._conversations.clear()
+    yield
+    claude_cli._conversations.clear()
 
 TOOLS = [{"type": "function", "function": {
     "name": "get_weather", "description": "Weather",
@@ -233,3 +243,44 @@ def test_images_are_sent_in_place_as_blocks():
     blocks = _blocks(run)
     assert blocks[0]["source"] == {"type": "base64", "media_type": "image/png", "data": "QUJD"}
     assert "[image 1 attached]" in blocks[1]["text"]
+
+
+def _turn(messages, result=None):
+    result = result or {"result": "ok", "usage": {"cache_read_input_tokens": 50,
+                                                   "cache_creation_input_tokens": 5}}
+    with usage_context("agent_turn", "hurayrah", "Hurayrah", "s1"):
+        out, _ = _run(result, messages=messages)
+    return out["diagnostics"]["cache"]
+
+
+def test_cache_diagnosis_explains_each_kind_of_miss():
+    from backend.agent_runtime.context import DATETIME_LINE_PREFIX
+
+    def system(clock, kb="a.md"):
+        return {"role": "system", "content": f"Rules. KB: {kb}\n\n{DATETIME_LINE_PREFIX}{clock}"}
+
+    step = [{"role": "user", "content": "go"},
+            {"role": "assistant", "content": "", "tool_calls": [{"id": "c1", "type": "function",
+             "function": {"name": "get_weather", "arguments": "{}"}}]},
+            {"role": "tool", "tool_call_id": "c1", "content": "sunny"}]
+
+    assert _turn([system("09:00"), step[0]])["reasons"] == ["first_call"]
+    grown = _turn([system("09:00")] + step)
+    assert grown["reasons"] == [] and grown["reused_blocks"] == 2
+    next_turn = _turn([system("09:05")] + step + [{"role": "user", "content": "more"}])
+    assert next_turn["reasons"] == ["context_moved"]
+    kb_changed = _turn([system("09:05", kb="a.md, b.md")] + step + [{"role": "user", "content": "more"}])
+    assert kb_changed["reasons"] == ["system_prompt_changed"]
+    rewritten = _turn([system("09:05", kb="a.md, b.md"), {"role": "user", "content": "[summary] go"}])
+    assert rewritten["reasons"] == ["history_rewritten_at_block_0"]
+
+
+def test_conversations_are_keyed_by_usage_context():
+    msgs = [{"role": "user", "content": "hi"}]
+    with usage_context("agent_turn", "a1", "A", "s1"):
+        _run({"result": "ok", "usage": {}}, messages=msgs)
+    with usage_context("summarizer", "a1", "A", "s1"):
+        out, _ = _run({"result": "ok", "usage": {}}, messages=msgs)
+    assert out["diagnostics"]["cache"]["reasons"] == ["first_call"]
+    assert set(claude_cli._conversations) == {"agent_turn|a1|s1|claude-sonnet-5-5",
+                                              "summarizer|a1|s1|claude-sonnet-5-5"}
