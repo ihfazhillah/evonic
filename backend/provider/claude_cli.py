@@ -543,6 +543,43 @@ def _tool_calls(structured: Dict[str, Any]) -> List[Dict[str, Any]]:
     return calls
 
 
+# ── Tool catalogue per conversation ──────────────────────────────────────────
+# The tool definitions sit at the very front of the prompt, so any change to
+# the list invalidates the cache for everything after it. Evonic changes the
+# list often: the agent loop prunes never-called tools from the third
+# iteration on and restores them on the next turn, and skills add or remove
+# tools. The adapter therefore keeps sending every tool seen in the
+# conversation (sorted, stable) and reports which ones are currently not
+# offered through the append-only context. Evonic still validates each call,
+# so a tool that was disabled or unloaded is refused there as before.
+
+_TOOL_AVAILABILITY = "tool availability"
+_ALL_TOOLS_AVAILABLE = "Tool availability: all listed tools are available."
+
+
+def _tool_union(seen: Dict[str, Dict[str, Any]], tools: List[Dict[str, Any]]):
+    """Return ``(catalogue, union, availability_part)``.
+
+    ``catalogue`` is the sorted tool list to send, ``union`` the updated
+    name -> tool map to remember, ``availability_part`` a context part naming
+    the tools Evonic did not offer on this call (``None`` when all are offered).
+    """
+    union = dict(seen)
+    offered = []
+    for tool in tools:
+        name = tool.get("function", {}).get("name")
+        if name:
+            union[name] = tool
+            offered.append(name)
+    missing = sorted(set(union) - set(offered))
+    part = None
+    if missing:
+        part = (_TOOL_AVAILABILITY,
+                "Tool availability: these tools are not available right now, do not "
+                "call them: " + ", ".join(missing) + ".")
+    return [union[name] for name in sorted(union)], union, part
+
+
 # ── Native tools over MCP ────────────────────────────────────────────────────
 # In "native" mode Evonic's tools reach the model as real tools, served by
 # claude_mcp_stub.py. The model calls them the way it was trained to, the
@@ -789,7 +826,7 @@ def _context_index(blocks: List[Dict[str, Any]]) -> Optional[int]:
 
 
 def _diagnose(previous: Optional[Dict[str, Any]], system_hash: str,
-              hashes: List[str]) -> Dict[str, Any]:
+              hashes: List[str], tools_hash: str = "") -> Dict[str, Any]:
     """Explain, before the call, which part of the prompt can no longer hit the cache."""
     if previous is None:
         return {"reasons": ["first_call"], "reused_blocks": 0, "previous_blocks": 0}
@@ -798,6 +835,8 @@ def _diagnose(previous: Optional[Dict[str, Any]], system_hash: str,
     while reused < min(len(old), len(hashes)) and old[reused] == hashes[reused]:
         reused += 1
     reasons = []
+    if previous.get("tools_hash", tools_hash) != tools_hash:
+        reasons.append("tools_changed")
     if previous["system_hash"] != system_hash:
         reasons.append("system_prompt_changed")
     if reused < len(old):
@@ -837,14 +876,20 @@ def send_request(
 
     system_prompt, parts, history = _split_system(messages)
     system_prompt = system_prompt or "You are a helpful assistant."
+    base = _history_blocks(history)
+    key = _conversation_key(model, system_prompt, base)
+    previous = _conversation(key) or {}
+
     mode = tool_mode() if tools else None
+    seen_tools = previous.get("tools", {})
+    if tools:
+        tools, seen_tools, availability = _tool_union(seen_tools, tools)
+        if availability:
+            parts = parts + [availability]
     if mode == "native":
         system_prompt += _native_tool_note(tool_choice)
     elif tools:
         system_prompt += _tool_instructions(tools, tool_choice)
-    base = _history_blocks(history)
-    key = _conversation_key(model, system_prompt, base)
-    previous = _conversation(key) or {}
 
     # The system prompt sent to the CLI stays frozen for the conversation:
     # Evonic rebuilds it when KB files, memory keys or the agent roster change,
@@ -862,6 +907,7 @@ def send_request(
     elif frozen is not None:
         defaults = dict(_sections(frozen))
     frozen = system_prompt if frozen is None else frozen
+    defaults = {**defaults, _TOOL_AVAILABILITY: _ALL_TOOLS_AVAILABLE}
     blocks, context_log = _place_context(base, parts + overrides, context_log, defaults)
     system_prompt = frozen
 
@@ -887,7 +933,8 @@ def send_request(
 
     system_hash = _digest(system_prompt)
     hashes = _block_hashes(blocks)
-    diagnosis = _diagnose(previous or None, system_hash, hashes)
+    tools_hash = _digest([t.get("function", {}) for t in tools or []])
+    diagnosis = _diagnose(previous or None, system_hash, hashes, tools_hash)
     diagnosis["instruction_overrides"] = len(overrides)
     if refreshed:
         diagnosis["reasons"].append("frozen_system_refreshed")
@@ -902,7 +949,7 @@ def send_request(
         return failure
     _remember(key, {"system_hash": system_hash, "hashes": hashes,
                     "context_index": _context_index(blocks), "context_log": context_log,
-                    "frozen_system": frozen})
+                    "frozen_system": frozen, "tools": seen_tools, "tools_hash": tools_hash})
     runs = [data]
     native_attempts = list(attempts)
 

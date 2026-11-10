@@ -563,3 +563,67 @@ def test_mcp_stub_lists_tools_and_refuses_calls(tmp_path):
     assert replies[1]["result"]["capabilities"] == {"tools": {}}
     assert replies[2]["result"]["tools"][0]["name"] == "get_weather"
     assert replies[3]["result"]["isError"] is True
+
+
+# ── tool catalogue per conversation ──────────────────────────────────────────
+
+def _tool(name):
+    return {"type": "function", "function": {"name": name, "description": name,
+                                             "parameters": {"type": "object", "properties": {}}}}
+
+
+def _catalogue(proc):
+    cmd = proc.cmd
+    server = json.loads(cmd[cmd.index("--mcp-config") + 1])["mcpServers"]["evonic"]
+    return [t["name"] for t in json.load(open(server["args"][2]))]
+
+
+def _native_step(tools, history):
+    with usage_context("agent_turn", "hurayrah", "Hurayrah", "s1"):
+        result, proc = _native(_stream({"type": "text", "text": "ok"}, stop_reason="end_turn"),
+                               messages=[{"role": "system", "content": "Be brief."}] + history,
+                               tools=tools)
+    blocks = [b["text"] for b in json.loads(proc.sent[0])["message"]["content"]]
+    return result["diagnostics"]["cache"], _catalogue(proc), blocks
+
+
+def test_pruned_tools_stay_in_the_catalogue_and_are_reported_unavailable(native_mode):
+    full = [_tool("bash"), _tool("send_file"), _tool("monitor")]
+    history = [{"role": "user", "content": "go"}]
+    _, first, _ = _native_step(full, history)
+    assert first == ["bash", "monitor", "send_file"]  # sorted, stable
+
+    # Iteration 3: the agent loop prunes the never-called tools.
+    history = history + [CALL, RESULT]
+    diag, pruned, blocks = _native_step([_tool("bash")], history)
+    assert pruned == first and "tools_changed" not in diag["reasons"]
+    assert blocks[-1].endswith("not available right now, do not call them: monitor, send_file.")
+
+    # Next turn: the full list is back; one small update says so.
+    history = history + [{"role": "user", "content": "again"}]
+    diag, again, blocks = _native_step(full, history)
+    assert again == first and diag["reasons"] == []
+    assert blocks[-1].endswith("Tool availability: all listed tools are available.")
+
+
+def test_a_new_tool_changes_the_catalogue_once(native_mode):
+    history = [{"role": "user", "content": "go"}]
+    _native_step([_tool("bash")], history)
+    diag, catalogue, _ = _native_step([_tool("bash"), _tool("deploy")], history + [CALL, RESULT])
+    assert catalogue == ["bash", "deploy"] and diag["reasons"] == ["tools_changed"]
+    diag, _, _ = _native_step([_tool("bash"), _tool("deploy")], history + [CALL, RESULT, CALL, RESULT])
+    assert diag["reasons"] == []
+
+
+def test_schema_mode_keeps_pruned_tools_in_the_system_prompt():
+    history = [{"role": "user", "content": "go"}]
+    full = [_tool("bash"), _tool("send_file")]
+    with usage_context("agent_turn", "hurayrah", "Hurayrah", "s2"):
+        _, first = _run({"result": "", "structured_output": {"text": "", "done": True, "tool_calls": []},
+                         "usage": {}}, messages=[{"role": "system", "content": "Be brief."}] + history,
+                        tools=full)
+        out, second = _run({"result": "", "structured_output": {"text": "", "done": True, "tool_calls": []},
+                            "usage": {}}, messages=[{"role": "system", "content": "Be brief."}] + history
+                           + [CALL, RESULT], tools=[_tool("bash")])
+    assert _system_arg(second) == _system_arg(first) and '"send_file"' in _system_arg(second)
+    assert out["diagnostics"]["cache"]["reasons"] == []
