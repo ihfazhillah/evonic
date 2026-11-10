@@ -14,6 +14,7 @@ prompt cache keeps matching the unchanged prefix between calls; a single
 growing text block would be re-written from scratch on every step.
 """
 
+import hashlib
 import json
 import logging
 import os
@@ -24,6 +25,7 @@ import tempfile
 import threading
 import time
 import uuid
+from collections import OrderedDict
 from typing import Any, Dict, List, Optional
 
 DEFAULT_TIMEOUT = 300
@@ -422,6 +424,93 @@ def _tool_calls(structured: Dict[str, Any]) -> List[Dict[str, Any]]:
     return calls
 
 
+# ── Cache diagnostics ────────────────────────────────────────────────────────
+# Per-conversation memory of what the previous call sent, so a cache miss can
+# be explained (system prompt changed, history rewritten, context moved). It is
+# best-effort: a restart only loses the comparison for the next call.
+
+_CONVERSATION_LIMIT = 256
+_conversations_lock = threading.Lock()
+_conversations: "OrderedDict[str, Dict[str, Any]]" = OrderedDict()
+
+
+def _digest(value: Any) -> str:
+    raw = value if isinstance(value, str) else json.dumps(value, sort_keys=True, ensure_ascii=False)
+    return hashlib.sha1(raw.encode("utf-8")).hexdigest()
+
+
+def _block_hashes(blocks: List[Dict[str, Any]]) -> List[str]:
+    """Chain hashes: each one identifies a block *and* everything before it."""
+    hashes, previous = [], ""
+    for block in blocks:
+        previous = _digest(previous + _digest(block))
+        hashes.append(previous)
+    return hashes
+
+
+def _conversation_key(model: str, system_prompt: str, blocks: List[Dict[str, Any]]) -> str:
+    from backend.llm_usage_events import current_usage_context
+
+    ctx = current_usage_context()
+    if ctx.get("session_id") or ctx.get("agent_id"):
+        return "|".join(str(ctx.get(k) or "") for k in ("source", "agent_id", "session_id")) + "|" + model
+    return "anon|" + _digest([model, system_prompt[:2000], blocks[0] if blocks else None])
+
+
+def _conversation(key: str) -> Optional[Dict[str, Any]]:
+    with _conversations_lock:
+        state = _conversations.get(key)
+        if state is not None:
+            _conversations.move_to_end(key)
+        return state
+
+
+def _remember(key: str, state: Dict[str, Any]) -> None:
+    with _conversations_lock:
+        _conversations[key] = state
+        _conversations.move_to_end(key)
+        while len(_conversations) > _CONVERSATION_LIMIT:
+            _conversations.popitem(last=False)
+
+
+def _context_index(blocks: List[Dict[str, Any]]) -> Optional[int]:
+    return next((i for i, b in enumerate(blocks)
+                 if str(b.get("text", "")).startswith("[context")), None)
+
+
+def _diagnose(previous: Optional[Dict[str, Any]], system_hash: str,
+              hashes: List[str]) -> Dict[str, Any]:
+    """Explain, before the call, which part of the prompt can no longer hit the cache."""
+    if previous is None:
+        return {"reasons": ["first_call"], "reused_blocks": 0, "previous_blocks": 0}
+    old = previous["hashes"]
+    reused = 0
+    while reused < min(len(old), len(hashes)) and old[reused] == hashes[reused]:
+        reused += 1
+    reasons = []
+    if previous["system_hash"] != system_hash:
+        reasons.append("system_prompt_changed")
+    if reused < len(old):
+        if previous.get("context_index") == reused:
+            reasons.append("context_moved")
+        else:
+            reasons.append(f"history_rewritten_at_block_{reused}")
+    return {"reasons": reasons, "reused_blocks": reused, "previous_blocks": len(old)}
+
+
+def _report_cache(key: str, diagnosis: Dict[str, Any], cache_read: int, cache_write: int) -> None:
+    diagnosis.update(cache_read=cache_read, cache_write=cache_write)
+    line = ("claude_cli cache %s: read=%d write=%d reused_blocks=%d/%d reasons=%s"
+            % (key, cache_read, cache_write, diagnosis["reused_blocks"],
+               diagnosis["previous_blocks"], ",".join(diagnosis["reasons"]) or "-"))
+    # A follow-up call that writes more than it reads lost a large part of its
+    # prefix; that is the case worth seeing in the log.
+    if diagnosis["reasons"] != ["first_call"] and cache_write > cache_read:
+        _logger.warning(line)
+    else:
+        _logger.info(line)
+
+
 def send_request(
     model: str,
     messages: List[Dict[str, Any]],
@@ -457,10 +546,17 @@ def send_request(
         cmd += ["--system-prompt", "Follow the instructions in the <system> block of the input."]
         blocks = [_text_block(f"<system>\n{system_prompt}\n</system>")] + blocks
 
+    key = _conversation_key(model, system_prompt, blocks)
+    system_hash = _digest(system_prompt)
+    hashes = _block_hashes(blocks)
+    diagnosis = _diagnose(_conversation(key), system_hash, hashes)
+
     timeout = timeout or DEFAULT_TIMEOUT
     data, attempts, failure = _run_cli(cmd, blocks, timeout)
     if failure:
         return failure
+    _remember(key, {"system_hash": system_hash, "hashes": hashes,
+                    "context_index": _context_index(blocks)})
     runs = [data]
     native_attempts = list(attempts)
 
@@ -489,13 +585,16 @@ def send_request(
 
     usage: Dict[str, int] = {}
     for run in runs:
-        for key, value in (run.get("usage") or {}).items():
+        for field, value in (run.get("usage") or {}).items():
             if isinstance(value, int):
-                usage[key] = usage.get(key, 0) + value
+                usage[field] = usage.get(field, 0) + value
     cache_read = usage.get("cache_read_input_tokens", 0)
     cache_write = usage.get("cache_creation_input_tokens", 0)
     prompt_tokens = usage.get("input_tokens", 0) + cache_read + cache_write
     completion_tokens = usage.get("output_tokens", 0)
+    first_usage = runs[0].get("usage") or {}
+    _report_cache(key, diagnosis, first_usage.get("cache_read_input_tokens", 0) or 0,
+                  first_usage.get("cache_creation_input_tokens", 0) or 0)
     message: Dict[str, Any] = {"role": "assistant", "content": text}
     if tool_calls:
         message["tool_calls"] = tool_calls
@@ -521,5 +620,6 @@ def send_request(
             "cli_calls": len(runs),
             "num_turns": sum(run.get("num_turns") or 0 for run in runs),
             "native_tool_attempts": native_attempts,
+            "cache": diagnosis,
         },
     }
