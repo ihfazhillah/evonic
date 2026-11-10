@@ -288,6 +288,49 @@ def _history_blocks(history: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
     return blocks or [_text_block("[user]\n(empty)")]
 
 
+# Share of the frozen system prompt that instruction overrides may reach before
+# the frozen copy is refreshed (one full cache miss) instead of growing further.
+_MAX_OVERRIDE_SHARE = 0.3
+_INSTRUCTIONS = "instructions: "
+_SECTION_HEADING = re.compile(r"^#{1,2} \S")
+
+
+def _sections(prompt: str) -> List[tuple]:
+    """Split a prompt into ``(heading, text)`` at ``#``/``##`` headings outside code fences."""
+    sections: List[tuple] = []
+    heading, lines, fenced = "(preamble)", [], False
+    for line in prompt.split("\n"):
+        if line.lstrip().startswith("```"):
+            fenced = not fenced
+        if not fenced and _SECTION_HEADING.match(line):
+            sections.append((heading, "\n".join(lines)))
+            heading, lines = line.strip(), []
+        lines.append(line)
+    sections.append((heading, "\n".join(lines)))
+    return _unique_keys([(f"{_INSTRUCTIONS}{h}", t.strip("\n")) for h, t in sections])
+
+
+def _instruction_overrides(frozen: str, prompt: str):
+    """Sections of ``prompt`` that differ from the frozen system prompt.
+
+    Returns ``(parts, defaults, size)``: the changed or new sections as context
+    parts, the frozen text of every section (what an override falls back to),
+    and the total size of the overrides in characters.
+    """
+    old = dict(_sections(frozen))
+    new = _sections(prompt)
+    parts = []
+    for key, text in new:
+        if old.get(key) != text:
+            parts.append((key, text if key != f"{_INSTRUCTIONS}(preamble)"
+                          else "[updated opening of your instructions]\n" + text))
+    names = {key for key, _ in new}
+    for key in old:
+        if key not in names:
+            parts.append((key, f"{key[len(_INSTRUCTIONS):]}: (removed from your instructions)"))
+    return parts, old, sum(len(text) for _, text in parts)
+
+
 # Receipt the agent loop puts in place of a skill's SYSTEM.md after its first
 # iteration (backend/agent_runtime/llm_loop.py). The full text already sent
 # stays valid, so the receipt is not an update.
@@ -299,7 +342,7 @@ _CONTEXT_UPDATE_HEADER = ("[context update] Each section below replaces the earl
 
 
 def _place_context(base: List[Dict[str, Any]], parts: List[tuple],
-                   log: List[Dict[str, Any]]):
+                   log: List[Dict[str, Any]], defaults: Optional[Dict[str, str]] = None):
     """Insert context blocks into the history so they never move.
 
     ``log`` holds the context blocks sent before, each anchored to the chain
@@ -308,7 +351,9 @@ def _place_context(base: List[Dict[str, Any]], parts: List[tuple],
     changed since then go out as a new entry after the last history block, so
     a datetime or agent-state change no longer invalidates the cached history.
     When the history was rewritten (summary) the anchors are gone and the
-    whole context is sent again from scratch. Returns ``(blocks, log)``.
+    whole context is sent again from scratch. ``defaults`` gives the value a
+    section falls back to when it is no longer overridden (the frozen system
+    prompt's own text). Returns ``(blocks, log)``.
     """
     hashes = _block_hashes(base)
     present = set(hashes)
@@ -318,6 +363,9 @@ def _place_context(base: List[Dict[str, Any]], parts: List[tuple],
     for entry in kept:
         sent.update(entry["values"])
     current = dict(parts)
+    for key, text in (defaults or {}).items():
+        if key in sent and key not in current:
+            current[key] = text
     changed: Dict[str, Optional[str]] = {}
     for key, text in current.items():
         if sent.get(key) == text:
@@ -332,7 +380,8 @@ def _place_context(base: List[Dict[str, Any]], parts: List[tuple],
     if changed:
         lines = [text if text is not None else f"{key}: (no longer active)"
                  for key, text in changed.items()]
-        header = _CONTEXT_UPDATE_HEADER if sent else _CONTEXT_HEADER
+        replaces = sent or any(key.startswith(_INSTRUCTIONS) for key in changed)
+        header = _CONTEXT_UPDATE_HEADER if replaces else _CONTEXT_HEADER
         kept = kept + [{"anchor": hashes[-1] if hashes else "",
                         "values": changed,
                         "text": header + "\n" + "\n\n".join(lines)}]
@@ -593,8 +642,26 @@ def send_request(
         system_prompt += _tool_instructions(tools, tool_choice)
     base = _history_blocks(history)
     key = _conversation_key(model, system_prompt, base)
-    previous = _conversation(key)
-    blocks, context_log = _place_context(base, parts, (previous or {}).get("context_log", []))
+    previous = _conversation(key) or {}
+
+    # The system prompt sent to the CLI stays frozen for the conversation:
+    # Evonic rebuilds it when KB files, memory keys or the agent roster change,
+    # and any byte changed there invalidates the cache for the entire history.
+    # Changed sections travel as context updates instead.
+    frozen = previous.get("frozen_system")
+    context_log = previous.get("context_log", [])
+    overrides: List[tuple] = []
+    defaults: Dict[str, str] = {}
+    refreshed = False
+    if frozen is not None and frozen != system_prompt:
+        overrides, defaults, size = _instruction_overrides(frozen, system_prompt)
+        if size > _MAX_OVERRIDE_SHARE * len(frozen):
+            frozen, overrides, defaults, context_log, refreshed = system_prompt, [], {}, [], True
+    elif frozen is not None:
+        defaults = dict(_sections(frozen))
+    frozen = system_prompt if frozen is None else frozen
+    blocks, context_log = _place_context(base, parts + overrides, context_log, defaults)
+    system_prompt = frozen
 
     cmd = [
         binary, "-p", "--model", model,
@@ -613,14 +680,18 @@ def send_request(
 
     system_hash = _digest(system_prompt)
     hashes = _block_hashes(blocks)
-    diagnosis = _diagnose(previous, system_hash, hashes)
+    diagnosis = _diagnose(previous or None, system_hash, hashes)
+    diagnosis["instruction_overrides"] = len(overrides)
+    if refreshed:
+        diagnosis["reasons"].append("frozen_system_refreshed")
 
     timeout = timeout or DEFAULT_TIMEOUT
     data, attempts, failure = _run_cli(cmd, blocks, timeout)
     if failure:
         return failure
     _remember(key, {"system_hash": system_hash, "hashes": hashes,
-                    "context_index": _context_index(blocks), "context_log": context_log})
+                    "context_index": _context_index(blocks), "context_log": context_log,
+                    "frozen_system": frozen})
     runs = [data]
     native_attempts = list(attempts)
 

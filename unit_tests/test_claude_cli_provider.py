@@ -267,7 +267,10 @@ def test_cache_diagnosis_explains_each_kind_of_miss():
     # Context blocks stay where they were sent, so a new turn reuses the whole prefix.
     assert next_turn["reasons"] == [] and next_turn["reused_blocks"] == 4
     kb_changed = _turn([system("09:05", kb="a.md, b.md")] + step + [{"role": "user", "content": "more"}])
-    assert kb_changed["reasons"] == ["system_prompt_changed"]
+    # The prompt is tiny, so the KB change is a large share of it: the frozen
+    # copy is refreshed instead of carrying an override.
+    assert kb_changed["reasons"] == ["system_prompt_changed", "context_moved",
+                                     "frozen_system_refreshed"]
     rewritten = _turn([system("09:05", kb="a.md, b.md"), {"role": "user", "content": "[summary] go"}])
     assert rewritten["reasons"] == ["history_rewritten_at_block_0"]
 
@@ -345,3 +348,53 @@ def test_rewritten_history_resends_the_whole_context():
     _, blocks = _ctx_turn([_sys("09:00:00"), STATE], [{"role": "user", "content": "[summary] went"}])
     assert blocks[0] == "[user]\n[summary] went"
     assert blocks[1].startswith("[context]\nCurrent date/time") and "Agent State" in blocks[1]
+
+
+def _system_arg(run):
+    cmd = run.call_args.args[0]
+    return cmd[cmd.index("--system-prompt") + 1]
+
+
+def _kb_turn(kb, history, extra=""):
+    rules = "\n".join(f"- rule {i}: be brief and cite sources." for i in range(40))
+    system = {"role": "system", "content": f"You are hurayrah.{extra}\n\n## Rules\n{rules}\n\n"
+                                           f"## Knowledge Base\n{kb}\n\n## Tail\nEnd."}
+    with usage_context("agent_turn", "hurayrah", "Hurayrah", "s1"):
+        out, run = _run({"result": "ok", "usage": {}}, messages=[system] + history)
+    return out, run, [b["text"] for b in _blocks(run)]
+
+
+def test_changed_system_sections_become_context_updates_and_the_prompt_stays_frozen():
+    history = [{"role": "user", "content": "go"}]
+    _, first_run, _ = _kb_turn("- a.md", history)
+    out, run, blocks = _kb_turn("- a.md\n- b.md", history + [CALL, RESULT])
+    assert _system_arg(run) == _system_arg(first_run)
+    assert out["diagnostics"]["cache"]["reasons"] == []
+    assert out["diagnostics"]["cache"]["instruction_overrides"] == 1
+    assert blocks[-1].startswith("[context update]")
+    assert blocks[-1].endswith("## Knowledge Base\n- a.md\n- b.md")
+    assert "## Rules" not in blocks[-1]
+
+    # Next step: the override is already in place, nothing new is appended.
+    _, _, again = _kb_turn("- a.md\n- b.md", history + [CALL, RESULT, CALL, RESULT])
+    assert again[:len(blocks)] == blocks and not again[-1].startswith("[context")
+
+    # The section goes back to the frozen text: one update restores it.
+    _, _, restored = _kb_turn("- a.md", history + [CALL, RESULT, CALL, RESULT])
+    assert restored[-1].endswith("## Knowledge Base\n- a.md")
+
+
+def test_large_system_changes_refresh_the_frozen_prompt():
+    history = [{"role": "user", "content": "go"}]
+    _kb_turn("- a.md", history)
+    big = "\n".join(f"- doc{i}.md" for i in range(60))
+    out, run, blocks = _kb_turn(big, history)
+    assert big in _system_arg(run)
+    assert "frozen_system_refreshed" in out["diagnostics"]["cache"]["reasons"]
+    assert not any(b.startswith("[context") for b in blocks)
+
+
+def test_headings_inside_code_fences_do_not_split_sections():
+    prompt = "Intro\n\n## Script\n```bash\n# not a heading\necho hi\n```\n\n## Next\nx"
+    keys = [key for key, _ in claude_cli._sections(prompt)]
+    assert keys == ["instructions: (preamble)", "instructions: ## Script", "instructions: ## Next"]
