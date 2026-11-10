@@ -9,12 +9,27 @@ import pytest
 from backend.llm_usage_events import usage_context
 from backend.provider import claude_cli
 
+_REAL_TOOL_MODE = claude_cli.tool_mode
+
 
 @pytest.fixture(autouse=True)
 def _fresh_conversations():
     claude_cli._conversations.clear()
     yield
     claude_cli._conversations.clear()
+
+
+@pytest.fixture
+def native_mode():
+    """Request this fixture to run a test in native tool mode."""
+
+
+@pytest.fixture(autouse=True)
+def _schema_mode_by_default(request):
+    """Tests exercise the --json-schema path unless they request ``native_mode``."""
+    mode = "native" if "native_mode" in request.fixturenames else "schema"
+    with patch.object(claude_cli, "tool_mode", return_value=mode):
+        yield
 
 TOOLS = [{"type": "function", "function": {
     "name": "get_weather", "description": "Weather",
@@ -398,3 +413,153 @@ def test_headings_inside_code_fences_do_not_split_sections():
     prompt = "Intro\n\n## Script\n```bash\n# not a heading\necho hi\n```\n\n## Next\nx"
     keys = [key for key, _ in claude_cli._sections(prompt)]
     assert keys == ["instructions: (preamble)", "instructions: ## Script", "instructions: ## Next"]
+
+
+# ── native tool mode ──────────────────────────────────────────────────────────
+
+class _FakePopen:
+    """Stands in for the CLI process: replays stream-json events, records kill()."""
+
+    instances = []
+
+    def __init__(self, cmd, **kwargs):
+        self.cmd, self.kwargs = cmd, kwargs
+        self.sent = []
+        self.killed = False
+        self.returncode = None
+        self.stdin = self
+        self.stdout = iter(json.dumps(e) + "\n" for e in _FakePopen.events)
+        _FakePopen.instances.append(self)
+
+    def write(self, data):
+        self.sent.append(data)
+
+    def close(self):
+        pass
+
+    def poll(self):
+        return self.returncode
+
+    def kill(self):
+        self.killed = True
+        self.returncode = -9
+
+    def communicate(self, timeout=None):
+        return "", ""
+
+
+def _stream(*blocks, stop_reason="tool_use", usage=None):
+    events = [{"type": "system", "subtype": "init", "tools": ["mcp__evonic__get_weather"]},
+              {"type": "stream_event", "event": {"type": "message_start", "message": {
+                  "id": "msg_1", "usage": usage or {"input_tokens": 3, "cache_read_input_tokens": 900,
+                                                    "cache_creation_input_tokens": 40, "output_tokens": 1}}}}]
+    for block in blocks:
+        events.append({"type": "assistant", "message": {"id": "msg_1", "content": [block]}})
+        if block.get("type") == "tool_use":
+            # The CLI denies MCP tools on its own; the denial arrives mid-message.
+            events.append({"type": "user", "message": {"content": [{"type": "tool_result",
+                           "content": "Claude requested permissions ...", "is_error": True}]}})
+    events += [{"type": "stream_event", "event": {"type": "message_delta",
+                "delta": {"stop_reason": stop_reason}, "usage": {"output_tokens": 12}}},
+               {"type": "stream_event", "event": {"type": "message_stop"}},
+               {"type": "assistant", "message": {"id": "msg_2", "content": [
+                   {"type": "text", "text": "reply to the denial (must be ignored)"}]}}]
+    return events
+
+
+def _native(events, messages=None, tools=TOOLS, **kwargs):
+    _FakePopen.events = events
+    _FakePopen.instances = []
+    messages = messages or [{"role": "system", "content": "Be brief."},
+                            {"role": "user", "content": "weather in Tokyo and Oslo?"}]
+    with patch.object(claude_cli, "claude_binary", return_value="/usr/bin/claude"), \
+         patch("backend.provider.claude_cli.subprocess.Popen", _FakePopen):
+        result = claude_cli.send_request("claude-sonnet-5-5", messages, tools=tools, **kwargs)
+    return result, _FakePopen.instances[-1]
+
+
+def _use(name, **args):
+    return {"type": "tool_use", "id": "toolu_1", "name": f"mcp__evonic__{name}", "input": args}
+
+
+def test_native_mode_returns_parallel_tool_uses_and_stops_the_cli(native_mode):
+    result, proc = _native(_stream({"type": "text", "text": "Checking both."},
+                                   _use("get_weather", city="Tokyo"), _use("get_weather", city="Oslo")))
+    choice = result["response"]["choices"][0]
+    assert choice["finish_reason"] == "tool_calls"
+    assert choice["message"]["content"] == "Checking both."
+    assert [json.loads(c["function"]["arguments"])["city"] for c in choice["message"]["tool_calls"]] \
+        == ["Tokyo", "Oslo"]
+    assert {c["function"]["name"] for c in choice["message"]["tool_calls"]} == {"get_weather"}
+    assert proc.killed  # stopped at message_stop, before the CLI answers its own denial
+    assert result["response"]["usage"]["prompt_tokens_details"] == {"cached_tokens": 900,
+                                                                     "cache_write_tokens": 40}
+    assert result["response"]["usage"]["completion_tokens"] == 12
+    assert result["diagnostics"]["tool_mode"] == "native"
+
+
+def test_native_mode_command_serves_tools_over_mcp(native_mode):
+    _, proc = _native(_stream(_use("get_weather", city="Tokyo")))
+    cmd = proc.cmd
+    assert "--json-schema" not in cmd and "--include-partial-messages" in cmd
+    assert cmd[cmd.index("--tools") + 1] == "" and "--strict-mcp-config" in cmd
+    assert "--allowedTools" not in cmd  # the CLI must keep denying the tools itself
+    server = json.loads(cmd[cmd.index("--mcp-config") + 1])["mcpServers"]["evonic"]
+    assert server["args"][:2] == ["-I", claude_cli._STUB]
+    catalogue = json.load(open(server["args"][2]))
+    assert catalogue == [{"name": "get_weather", "description": "Weather",
+                          "inputSchema": TOOLS[0]["function"]["parameters"]}]
+    system = cmd[cmd.index("--system-prompt") + 1]
+    assert "call them directly" in system and "get_weather" not in system
+
+
+def test_native_mode_text_reply_ends_the_turn(native_mode):
+    result, _ = _native(_stream({"type": "text", "text": "Sunny in Tokyo."}, stop_reason="end_turn"))
+    choice = result["response"]["choices"][0]
+    assert choice["finish_reason"] == "stop" and choice["message"]["content"] == "Sunny in Tokyo."
+    assert "tool_calls" not in choice["message"]
+
+
+def test_native_mode_aliases_names_that_do_not_fit_mcp(native_mode):
+    long_name = "x" * 60
+    tools = [{"type": "function", "function": {"name": long_name, "description": "", "parameters": {}}},
+             {"type": "function", "function": {"name": "kb.search", "description": "", "parameters": {}}}]
+    aliases = claude_cli._tool_aliases(tools)
+    assert set(aliases.values()) == {long_name, "kb.search"}
+    assert all(len("mcp__evonic__" + a) <= 64 and claude_cli._TOOL_NAME.match(a) for a in aliases)
+    alias = next(a for a, n in aliases.items() if n == "kb.search")
+    result, _ = _native(_stream(_use(alias, q="x")), tools=tools)
+    assert result["response"]["choices"][0]["message"]["tool_calls"][0]["function"]["name"] == "kb.search"
+
+
+def test_native_mode_reports_cli_errors(native_mode):
+    events = [{"type": "result", "is_error": True, "result": "Claude usage limit reached"}]
+    result, _ = _native(events)
+    assert not result["success"] and result["error_type"] == "rate_limit_error"
+
+
+def test_tool_mode_setting_defaults_to_native():
+    from models.db import db
+    for stored, expected in ((None, "native"), ("schema", "schema"), (" Native ", "native"),
+                             ("bogus", "native")):
+        with patch.object(db, "get_setting", return_value=stored):
+            assert _REAL_TOOL_MODE() == expected
+
+
+def test_mcp_stub_lists_tools_and_refuses_calls(tmp_path):
+    import sys
+    catalogue = tmp_path / "tools.json"
+    catalogue.write_text(json.dumps([{"name": "get_weather", "description": "", "inputSchema": {"type": "object"}}]))
+    requests = [
+        {"jsonrpc": "2.0", "id": 1, "method": "initialize", "params": {"protocolVersion": "2025-06-18"}},
+        {"jsonrpc": "2.0", "method": "notifications/initialized"},
+        {"jsonrpc": "2.0", "id": 2, "method": "tools/list"},
+        {"jsonrpc": "2.0", "id": 3, "method": "tools/call", "params": {"name": "get_weather", "arguments": {}}},
+    ]
+    proc = subprocess.run([sys.executable, "-I", claude_cli._STUB, str(catalogue)],
+                          input="".join(json.dumps(r) + "\n" for r in requests),
+                          capture_output=True, text=True, timeout=30)
+    replies = {r["id"]: r for r in map(json.loads, proc.stdout.splitlines())}
+    assert replies[1]["result"]["capabilities"] == {"tools": {}}
+    assert replies[2]["result"]["tools"][0]["name"] == "get_weather"
+    assert replies[3]["result"]["isError"] is True

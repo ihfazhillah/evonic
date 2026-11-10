@@ -4,8 +4,15 @@ Evonic never reads, copies or refreshes Claude OAuth tokens. The user logs in
 with ``claude auth login`` and Evonic only spawns the CLI in print mode, so the
 Claude Code client itself talks to Anthropic. The CLI runs here as a plain LLM:
 its built-in tools, settings, MCP servers and session persistence are disabled,
-and Evonic's own tools are emulated through ``--json-schema`` so the agent loop,
-workplaces and safety checks in Evonic stay in charge of every action.
+and the agent loop, workplaces and safety checks in Evonic stay in charge of
+every action. Evonic's tools reach the model in one of two modes (app setting
+``claude_cli_tool_mode``):
+
+- ``native`` (default): served as real tools by ``claude_mcp_stub.py``; the
+  adapter stops the CLI when the model's message ends with ``tool_use`` and
+  hands the calls to Evonic. The CLI denies the tools itself, so nothing runs
+  inside it.
+- ``schema``: emulated through ``--json-schema`` ({text, tool_calls, done}).
 
 The module is an adapter: Evonic's rules apply on the way out (OpenAI-shaped
 messages, honest ``tool_calls``/``finish_reason``), Claude's rules apply on the
@@ -21,6 +28,7 @@ import os
 import re
 import shutil
 import subprocess
+import sys
 import tempfile
 import threading
 import time
@@ -535,6 +543,197 @@ def _tool_calls(structured: Dict[str, Any]) -> List[Dict[str, Any]]:
     return calls
 
 
+# ── Native tools over MCP ────────────────────────────────────────────────────
+# In "native" mode Evonic's tools reach the model as real tools, served by
+# claude_mcp_stub.py. The model calls them the way it was trained to, the
+# adapter reads the stream until the message ends and stops the CLI before it
+# would act on a tool_use; Evonic executes the calls. "schema" mode is the
+# older --json-schema emulation, kept as a fallback (setting below).
+
+TOOL_MODE_SETTING = "claude_cli_tool_mode"
+TOOL_MODES = ("native", "schema")
+_MCP_SERVER = "evonic"
+_MCP_PREFIX = f"mcp__{_MCP_SERVER}__"
+_MAX_TOOL_NAME = 64
+_TOOL_NAME = re.compile(r"^[A-Za-z0-9_-]+$")
+_STUB = os.path.join(os.path.dirname(os.path.abspath(__file__)), "claude_mcp_stub.py")
+
+
+def tool_mode() -> str:
+    """``native`` (default) or ``schema``, from the ``claude_cli_tool_mode`` setting."""
+    try:
+        from models.db import db
+        value = (db.get_setting(TOOL_MODE_SETTING) or "").strip().lower()
+    except Exception:
+        value = ""
+    return value if value in TOOL_MODES else "native"
+
+
+def _tool_aliases(tools: List[Dict[str, Any]]) -> Dict[str, str]:
+    """MCP name -> Evonic name. Names that do not fit MCP's limits get a stable alias."""
+    aliases: Dict[str, str] = {}
+    room = _MAX_TOOL_NAME - len(_MCP_PREFIX)
+    for tool in tools:
+        name = str(tool.get("function", {}).get("name") or "")
+        if not name:
+            continue
+        alias = name
+        if not _TOOL_NAME.match(name) or len(name) > room or alias in aliases:
+            alias = re.sub(r"[^A-Za-z0-9_-]", "_", name)[:room - 9] + "_" + _digest(name)[:8]
+        aliases[alias] = name
+    return aliases
+
+
+def _write_tool_catalogue(tools: List[Dict[str, Any]], aliases: Dict[str, str]) -> str:
+    by_name = {t.get("function", {}).get("name"): t.get("function", {}) for t in tools}
+    specs = []
+    for alias, name in aliases.items():
+        fn = by_name.get(name) or {}
+        schema = fn.get("parameters")
+        if not isinstance(schema, dict) or schema.get("type") != "object":
+            schema = {"type": "object", "properties": {}}
+        specs.append({"name": alias, "description": fn.get("description", ""), "inputSchema": schema})
+    content = json.dumps(specs, ensure_ascii=False, sort_keys=True)
+    # Named by content: identical tool sets share one file and one MCP config.
+    path = os.path.join(_neutral_cwd(), f"tools-{_digest(content)[:16]}.json")
+    if not os.path.exists(path):
+        partial = f"{path}.{uuid.uuid4().hex}"
+        with open(partial, "w", encoding="utf-8") as handle:
+            handle.write(content)
+        os.replace(partial, path)
+    return path
+
+
+def _mcp_config(catalogue: str) -> str:
+    return json.dumps({"mcpServers": {_MCP_SERVER: {
+        "command": sys.executable, "args": ["-I", _STUB, catalogue]}}})
+
+
+def _native_tool_note(tool_choice: Optional[str]) -> str:
+    rule = f" You MUST call the tool `{tool_choice}` in this reply." if tool_choice else ""
+    return (
+        "\n\n# Tools\n"
+        "Your tools are available as native tools; call them directly. Earlier tool "
+        "calls appear in the transcript as text ([assistant tool_call ...] and "
+        "[tool_result ...] entries); that is only a record of what happened, never "
+        "write tool calls as text. A reply without a tool call ends your turn: if you "
+        "are about to do something, call the tool in this same reply instead of "
+        "describing the plan." + rule)
+
+
+def _run_native(cmd: List[str], blocks: List[Dict[str, Any]], timeout: int):
+    """Run one CLI call in native mode and stop it when the first message ends.
+
+    Returns ``(data, None)`` or ``(None, failure)``; ``data`` carries ``text``,
+    ``tool_uses`` ({name, input}), ``stop_reason`` and ``usage``. The CLI
+    denies the MCP tools itself, so even a late stop executes nothing; stopping
+    at ``message_stop`` just avoids the follow-up API call it would make.
+    """
+    start = time.time()
+    payload = json.dumps({"type": "user", "message": {"role": "user", "content": blocks}},
+                         ensure_ascii=False) + "\n"
+    try:
+        proc = subprocess.Popen(cmd, stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+                                stderr=subprocess.PIPE, text=True, cwd=_neutral_cwd(),
+                                env={**os.environ, **CHILD_ENV})
+    except OSError as exc:
+        return None, _fail("connection_error", str(exc), 0)
+    timed_out = threading.Event()
+
+    def expire():
+        timed_out.set()
+        proc.kill()
+
+    watchdog = threading.Timer(timeout, expire)
+    watchdog.daemon = True
+    watchdog.start()
+    usage: Dict[str, Any] = {}
+    texts: List[str] = []
+    tool_uses: List[Dict[str, Any]] = []
+    stop_reason = None
+    finished = False
+    result_event = None
+    message_id = None
+    try:
+        proc.stdin.write(payload)
+        proc.stdin.close()
+        for line in proc.stdout:
+            try:
+                event = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            kind = event.get("type") if isinstance(event, dict) else None
+            if kind == "stream_event":
+                inner = event.get("event") or {}
+                if inner.get("type") == "message_start":
+                    usage = dict((inner.get("message") or {}).get("usage") or {})
+                elif inner.get("type") == "message_delta":
+                    stop_reason = (inner.get("delta") or {}).get("stop_reason") or stop_reason
+                    for field, value in (inner.get("usage") or {}).items():
+                        if isinstance(value, int) and value:
+                            usage[field] = value
+                elif inner.get("type") == "message_stop":
+                    finished = True
+                    break
+            elif kind == "assistant":
+                message = event.get("message") or {}
+                message_id = message_id or message.get("id")
+                if message.get("id") != message_id:
+                    continue
+                for block in message.get("content") or []:
+                    if block.get("type") == "text" and block.get("text"):
+                        texts.append(block["text"])
+                    elif block.get("type") == "tool_use":
+                        tool_uses.append({"name": block.get("name"), "input": block.get("input") or {}})
+            elif kind == "result":
+                result_event = event
+                break
+    except (OSError, ValueError):
+        pass
+    finally:
+        watchdog.cancel()
+        if proc.poll() is None:
+            proc.kill()
+        try:
+            stderr = proc.communicate(timeout=10)[1] or ""
+        except (subprocess.TimeoutExpired, ValueError, OSError):
+            stderr = ""
+
+    duration_ms = int((time.time() - start) * 1000)
+    if timed_out.is_set() and not finished:
+        return None, _fail("timeout_error", "claude -p timed out", duration_ms)
+    if result_event is not None and (result_event.get("is_error") or not finished and not texts):
+        detail = str(result_event.get("result") or stderr or "claude -p failed")[:500]
+        error_type = ("rate_limit_error" if result_event.get("api_error_status") == 429
+                      else _classify_error(detail))
+        return None, _fail(error_type, detail, duration_ms)
+    if not finished and result_event is None:
+        detail = (stderr or "claude -p ended without a reply").strip()[:500]
+        return None, _fail(_classify_error(detail), detail, duration_ms)
+    if result_event is not None and not usage:
+        usage = dict(result_event.get("usage") or {})
+    return {"text": "\n\n".join(texts), "tool_uses": tool_uses, "stop_reason": stop_reason,
+            "usage": usage, "num_turns": 1, "_duration_ms": duration_ms}, None
+
+
+def _native_tool_calls(tool_uses: List[Dict[str, Any]], aliases: Dict[str, str]) -> List[Dict[str, Any]]:
+    calls = []
+    for use in tool_uses:
+        name = str(use.get("name") or "")
+        if name.startswith(_MCP_PREFIX):
+            name = name[len(_MCP_PREFIX):]
+        name = aliases.get(name, name)
+        if not name:
+            continue
+        calls.append({
+            "id": f"call_{uuid.uuid4().hex[:24]}",
+            "type": "function",
+            "function": {"name": name,
+                         "arguments": json.dumps(use.get("input") or {}, ensure_ascii=False)},
+        })
+    return calls
+
+
 # ── Cache diagnostics ────────────────────────────────────────────────────────
 # Per-conversation memory of what the previous call sent, so a cache miss can
 # be explained (system prompt changed, history rewritten, context moved). It is
@@ -638,7 +837,10 @@ def send_request(
 
     system_prompt, parts, history = _split_system(messages)
     system_prompt = system_prompt or "You are a helpful assistant."
-    if tools:
+    mode = tool_mode() if tools else None
+    if mode == "native":
+        system_prompt += _native_tool_note(tool_choice)
+    elif tools:
         system_prompt += _tool_instructions(tools, tool_choice)
     base = _history_blocks(history)
     key = _conversation_key(model, system_prompt, base)
@@ -670,7 +872,12 @@ def send_request(
         "--setting-sources", "", "--strict-mcp-config",
     ]
     cmd += ["--effort", resolve_effort(thinking, thinking_budget)]
-    if tools:
+    aliases: Dict[str, str] = {}
+    if mode == "native":
+        aliases = _tool_aliases(tools)
+        cmd += ["--include-partial-messages",
+                "--mcp-config", _mcp_config(_write_tool_catalogue(tools, aliases))]
+    elif tools:
         cmd += ["--json-schema", json.dumps(_OUTPUT_SCHEMA)]
     if len(system_prompt.encode("utf-8")) <= MAX_ARGV_SYSTEM_PROMPT:
         cmd += ["--system-prompt", system_prompt]
@@ -686,7 +893,11 @@ def send_request(
         diagnosis["reasons"].append("frozen_system_refreshed")
 
     timeout = timeout or DEFAULT_TIMEOUT
-    data, attempts, failure = _run_cli(cmd, blocks, timeout)
+    if mode == "native":
+        data, failure = _run_native(cmd, blocks, timeout)
+        attempts = []
+    else:
+        data, attempts, failure = _run_cli(cmd, blocks, timeout)
     if failure:
         return failure
     _remember(key, {"system_hash": system_hash, "hashes": hashes,
@@ -697,7 +908,10 @@ def send_request(
 
     text = data.get("result") or ""
     tool_calls: List[Dict[str, Any]] = []
-    if tools:
+    if mode == "native":
+        text = data["text"]
+        tool_calls = _native_tool_calls(data["tool_uses"], aliases)
+    elif tools:
         structured = _structured_reply(data)
         text = structured.get("text") or ""
         tool_calls = _tool_calls(structured)
@@ -755,6 +969,8 @@ def send_request(
             "cli_calls": len(runs),
             "num_turns": sum(run.get("num_turns") or 0 for run in runs),
             "native_tool_attempts": native_attempts,
+            "tool_mode": mode,
+            "stop_reason": data.get("stop_reason"),
             "cache": diagnosis,
         },
     }
