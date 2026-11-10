@@ -63,6 +63,7 @@ class UsageDB:
                     estimated         INTEGER NOT NULL DEFAULT 0,
                     provider          TEXT NOT NULL DEFAULT '',
                     cached_tokens     INTEGER NOT NULL DEFAULT 0,
+                    cache_write_tokens INTEGER NOT NULL DEFAULT 0,
                     reasoning_tokens  INTEGER NOT NULL DEFAULT 0,
                     usage_details_available INTEGER NOT NULL DEFAULT 0,
                     duration_ms       INTEGER NOT NULL DEFAULT 0,
@@ -74,6 +75,7 @@ class UsageDB:
             for name, definition in (
                 ('provider', "TEXT NOT NULL DEFAULT ''"),
                 ('cached_tokens', 'INTEGER NOT NULL DEFAULT 0'),
+                ('cache_write_tokens', 'INTEGER NOT NULL DEFAULT 0'),
                 ('reasoning_tokens', 'INTEGER NOT NULL DEFAULT 0'),
                 ('usage_details_available', 'INTEGER NOT NULL DEFAULT 0'),
             ):
@@ -91,18 +93,20 @@ class UsageDB:
                prompt_tokens: int, completion_tokens: int, total_tokens: int,
                estimated: bool = False, duration_ms: int = 0,
                provider: Optional[str] = None, cached_tokens: int = 0,
+               cache_write_tokens: int = 0,
                reasoning_tokens: int = 0, usage_details_available: bool = False) -> None:
         with self._connect() as conn:
             conn.execute("""
                 INSERT INTO token_usage (source, agent_id, agent_name, session_id, model,
                                          prompt_tokens, completion_tokens, total_tokens,
-                                         estimated, provider, cached_tokens, reasoning_tokens,
-                                         usage_details_available, duration_ms, created_at)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                                         estimated, provider, cached_tokens, cache_write_tokens,
+                                         reasoning_tokens, usage_details_available, duration_ms,
+                                         created_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """, (source or 'other', agent_id, agent_name, session_id, model or '',
                   int(prompt_tokens or 0), int(completion_tokens or 0), int(total_tokens or 0),
                   1 if estimated else 0, provider or '', int(cached_tokens or 0),
-                  int(reasoning_tokens or 0), 1 if usage_details_available else 0,
+                  int(cache_write_tokens or 0), int(reasoning_tokens or 0), 1 if usage_details_available else 0,
                   int(duration_ms or 0), _now()))
 
     # ── Aggregations ──────────────────────────────────────────────────
@@ -140,6 +144,7 @@ class UsageDB:
                           COALESCE(SUM(completion_tokens), 0) AS completion_tokens,
                           COALESCE(SUM(total_tokens), 0) AS total_tokens,
                           COALESCE(SUM(cached_tokens), 0) AS cached_tokens,
+                          COALESCE(SUM(cache_write_tokens), 0) AS cache_write_tokens,
                           COALESCE(SUM(reasoning_tokens), 0) AS reasoning_tokens,
                           COALESCE(SUM(estimated), 0) AS estimated_calls,
                           COALESCE(SUM(usage_details_available), 0) AS detailed_calls
@@ -152,6 +157,7 @@ class UsageDB:
                                COALESCE(SUM(completion_tokens), 0) AS completion_tokens,
                                COALESCE(SUM(total_tokens), 0) AS total_tokens,
                                COALESCE(SUM(cached_tokens), 0) AS cached_tokens,
+                               COALESCE(SUM(cache_write_tokens), 0) AS cache_write_tokens,
                                COALESCE(SUM(reasoning_tokens), 0) AS reasoning_tokens
                         FROM token_monitor_snapshot GROUP BY {column}
                         ORDER BY total_tokens DESC''').fetchall()]
@@ -164,6 +170,7 @@ class UsageDB:
                            COALESCE(SUM(completion_tokens), 0) AS completion_tokens,
                            COALESCE(SUM(total_tokens), 0) AS total_tokens,
                            COALESCE(SUM(cached_tokens), 0) AS cached_tokens,
+                           COALESCE(SUM(cache_write_tokens), 0) AS cache_write_tokens,
                            COALESCE(SUM(reasoning_tokens), 0) AS reasoning_tokens
                     FROM token_monitor_snapshot GROUP BY bucket ORDER BY bucket''').fetchall()]
             raw_agents = [dict(row) for row in conn.execute(
@@ -172,11 +179,12 @@ class UsageDB:
                           COALESCE(SUM(completion_tokens), 0) AS completion_tokens,
                           COALESCE(SUM(total_tokens), 0) AS total_tokens,
                           COALESCE(SUM(cached_tokens), 0) AS cached_tokens,
+                          COALESCE(SUM(cache_write_tokens), 0) AS cache_write_tokens,
                           COALESCE(SUM(reasoning_tokens), 0) AS reasoning_tokens
                    FROM token_monitor_snapshot GROUP BY agent_id ORDER BY total_tokens DESC''').fetchall()]
 
         fields = ('calls', 'prompt_tokens', 'completion_tokens', 'total_tokens',
-                  'cached_tokens', 'reasoning_tokens')
+                  'cached_tokens', 'cache_write_tokens', 'reasoning_tokens')
         merged: Dict[str, Dict[str, Any]] = {}
         standalone = []
         for row in raw_agents:
@@ -200,8 +208,8 @@ class UsageDB:
             target = merged.setdefault(key, {
                 'agent_id': key, 'agent_name': row.get('agent_name'),
                 'calls': 0, 'prompt_tokens': 0, 'completion_tokens': 0,
-                'total_tokens': 0, 'cached_tokens': 0, 'reasoning_tokens': 0,
-                **flags,
+                'total_tokens': 0, 'cached_tokens': 0, 'cache_write_tokens': 0,
+                'reasoning_tokens': 0, **flags,
             })
             for field in fields:
                 target[field] += row.get(field, 0) or 0
