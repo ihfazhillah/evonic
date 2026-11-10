@@ -117,7 +117,7 @@ def test_older_blocks_stay_identical_when_history_grows():
     assert first.call_args.args[0] == second.call_args.args[0]
 
 
-def test_datetime_and_volatile_system_messages_move_next_to_the_latest_user_message():
+def test_datetime_and_volatile_system_messages_leave_the_system_prompt():
     from backend.agent_runtime.context import DATETIME_LINE_PREFIX
 
     messages = [
@@ -127,9 +127,6 @@ def test_datetime_and_volatile_system_messages_move_next_to_the_latest_user_mess
         {"role": "user", "content": "earlier"},
         {"role": "assistant", "content": "ok"},
         {"role": "user", "content": "now"},
-        {"role": "assistant", "content": "", "tool_calls": [{"id": "c1", "type": "function",
-         "function": {"name": "get_weather", "arguments": "{}"}}]},
-        {"role": "tool", "tool_call_id": "c1", "content": "sunny"},
     ]
     _, run = _run({"result": "ok", "usage": {}}, messages=messages)
     system = run.call_args.args[0][run.call_args.args[0].index("--system-prompt") + 1]
@@ -137,8 +134,7 @@ def test_datetime_and_volatile_system_messages_move_next_to_the_latest_user_mess
     texts = [b["text"] for b in _blocks(run)]
     assert texts[:3] == ["[user]\nearlier", "[assistant]\nok", "[user]\nnow"]
     assert texts[3].startswith("[context]\nCurrent date/time: Monday, 2026-11-10, 09:15:02")
-    assert "## Agent State\nfocus: task 21" in texts[3]
-    assert texts[4].startswith("[assistant tool_call id=c1")
+    assert texts[3].endswith("## Agent State\nfocus: task 21")
 
 
 def test_done_false_without_tool_calls_is_retried_once():
@@ -268,7 +264,8 @@ def test_cache_diagnosis_explains_each_kind_of_miss():
     grown = _turn([system("09:00")] + step)
     assert grown["reasons"] == [] and grown["reused_blocks"] == 2
     next_turn = _turn([system("09:05")] + step + [{"role": "user", "content": "more"}])
-    assert next_turn["reasons"] == ["context_moved"]
+    # Context blocks stay where they were sent, so a new turn reuses the whole prefix.
+    assert next_turn["reasons"] == [] and next_turn["reused_blocks"] == 4
     kb_changed = _turn([system("09:05", kb="a.md, b.md")] + step + [{"role": "user", "content": "more"}])
     assert kb_changed["reasons"] == ["system_prompt_changed"]
     rewritten = _turn([system("09:05", kb="a.md, b.md"), {"role": "user", "content": "[summary] go"}])
@@ -284,3 +281,67 @@ def test_conversations_are_keyed_by_usage_context():
     assert out["diagnostics"]["cache"]["reasons"] == ["first_call"]
     assert set(claude_cli._conversations) == {"agent_turn|a1|s1|claude-sonnet-5-5",
                                               "summarizer|a1|s1|claude-sonnet-5-5"}
+
+
+def _ctx_turn(system_messages, history):
+    with usage_context("agent_turn", "hurayrah", "Hurayrah", "s1"):
+        out, run = _run({"result": "ok", "usage": {}}, messages=system_messages + history)
+    return out, [b["text"] for b in _blocks(run)]
+
+
+def _sys(clock):
+    return {"role": "system", "content": f"Rules.\n\nCurrent date/time: Monday, 2026-11-10, {clock} (WIB/UTC+7)"}
+
+
+STATE = {"role": "system", "content": "## Agent State\nfocus: task 21"}
+CALL = {"role": "assistant", "content": "", "tool_calls": [{"id": "c1", "type": "function",
+        "function": {"name": "get_weather", "arguments": "{}"}}]}
+RESULT = {"role": "tool", "tool_call_id": "c1", "content": "sunny"}
+
+
+def test_context_blocks_never_move_and_only_changes_are_appended():
+    _, first = _ctx_turn([_sys("09:00:00"), STATE], [{"role": "user", "content": "go"}])
+    assert first[1].startswith("[context]\nCurrent date/time")
+
+    # Same turn, one tool step later: earlier blocks unchanged, no new context.
+    _, step = _ctx_turn([_sys("09:00:00"), STATE], [{"role": "user", "content": "go"}, CALL, RESULT])
+    assert step[:2] == first and len(step) == 4
+
+    # New turn: the clock changed, the agent state did not.
+    history = [{"role": "user", "content": "go"}, CALL, RESULT, {"role": "user", "content": "more"}]
+    _, turn2 = _ctx_turn([_sys("09:07:12"), STATE], history)
+    assert turn2[:4] == step
+    assert turn2[4] == "[user]\nmore"
+    assert turn2[5].startswith("[context update]")
+    assert "09:07:12" in turn2[5] and "Agent State" not in turn2[5]
+    out, _ = _ctx_turn([_sys("09:07:12"), STATE], history)
+    assert out["diagnostics"]["cache"]["reasons"] == []
+
+
+def test_agent_state_change_and_removal_are_updates():
+    history = [{"role": "user", "content": "go"}]
+    _ctx_turn([_sys("09:00:00"), STATE], history)
+    changed = {"role": "system", "content": "## Agent State\nfocus: task 22"}
+    _, blocks = _ctx_turn([_sys("09:00:00"), changed], history)
+    assert blocks[-1] == ("[context update] Each section below replaces the earlier value of the "
+                          "section with the same heading.\n## Agent State\nfocus: task 22")
+    _, blocks = _ctx_turn([_sys("09:00:00")], history)
+    assert blocks[-1].endswith("## Agent State: (no longer active)")
+
+
+def test_skill_receipt_keeps_the_full_skill_text():
+    history = [{"role": "user", "content": "go"}]
+    full = {"role": "system", "content": "## Skill Context: deploy\n\nStep 1: build. Step 2: ship."}
+    receipt = {"role": "system", "content": '## Skill Context: deploy\n\n[Skill "deploy" is loaded. '
+               'Refer to earlier system message for full instructions.]'}
+    _, first = _ctx_turn([_sys("09:00:00"), full], history)
+    _, second = _ctx_turn([_sys("09:00:00"), receipt], history + [CALL, RESULT])
+    assert second[:2] == first and "Step 2: ship." in second[1]
+    assert not any(b.startswith("[context update]") for b in second)
+
+
+def test_rewritten_history_resends_the_whole_context():
+    _ctx_turn([_sys("09:00:00"), STATE], [{"role": "user", "content": "go"}, CALL, RESULT])
+    _, blocks = _ctx_turn([_sys("09:00:00"), STATE], [{"role": "user", "content": "[summary] went"}])
+    assert blocks[0] == "[user]\n[summary] went"
+    assert blocks[1].startswith("[context]\nCurrent date/time") and "Agent State" in blocks[1]
