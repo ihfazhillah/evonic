@@ -214,39 +214,44 @@ def _split_system(messages: List[Dict[str, Any]]):
     Only the first system message becomes the CLI system prompt. The other
     leading system messages (agent state, skill context) are rewritten by the
     agent loop between iterations; at the front of the prompt each rewrite
-    would invalidate the cache for the whole history, so they travel as
-    context next to the latest user message instead. System messages inside
-    the history stay where they are.
+    would invalidate the cache for the whole history, so they become context
+    parts, keyed by their first line. System messages inside the history stay
+    where they are.
     """
     system_prompt = ""
-    context: List[str] = []
+    parts: List[tuple] = []
     index = 0
     while index < len(messages) and messages[index].get("role") == "system":
         text = _content_text(messages[index].get("content"))
         if index == 0:
             system_prompt = text
         elif text:
-            context.append(text)
+            parts.append((text.strip().splitlines()[0], text))
         index += 1
 
     stamps = [m.group(0).strip() for m in _DATETIME_LINE.finditer(system_prompt)]
     if stamps:
         system_prompt = _DATETIME_LINE.sub("", system_prompt)
-        context = stamps + context
-    return system_prompt, context, messages[index:]
+        parts = [("datetime", "\n".join(stamps))] + parts
+    return system_prompt, _unique_keys(parts), messages[index:]
 
 
-def _history_blocks(history: List[Dict[str, Any]], context: List[str]) -> List[Dict[str, Any]]:
+def _unique_keys(parts: List[tuple]) -> List[tuple]:
+    seen: Dict[str, int] = {}
+    unique = []
+    for key, text in parts:
+        seen[key] = seen.get(key, 0) + 1
+        unique.append((key if seen[key] == 1 else f"{key} #{seen[key]}", text))
+    return unique
+
+
+def _history_blocks(history: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
     """One content block per message; consecutive tool results share one block.
 
     Blocks for older messages must come out byte-identical on every call; the
-    cache only hits on an unchanged prefix of whole blocks. Volatile context is
-    placed right after the latest user message: it then only moves when a new
-    user message arrives, not on every tool step.
+    cache only hits on an unchanged prefix of whole blocks.
     """
-    anchor = max((i for i, m in enumerate(history) if m.get("role") == "user"), default=None)
-    context_block = _text_block("[context]\n" + "\n\n".join(context)) if context else None
-    blocks: List[Dict[str, Any]] = [context_block] if context_block and anchor is None else []
+    blocks: List[Dict[str, Any]] = []
     images: List[Dict[str, Any]] = []
     tool_results: List[str] = []
 
@@ -255,7 +260,7 @@ def _history_blocks(history: List[Dict[str, Any]], context: List[str]) -> List[D
             blocks.append(_text_block("\n\n".join(tool_results)))
             tool_results.clear()
 
-    for index, message in enumerate(history):
+    for message in history:
         role = message.get("role")
         if role == "tool":
             text = _content_text(message.get("content"))
@@ -279,10 +284,67 @@ def _history_blocks(history: List[Dict[str, Any]], context: List[str]) -> List[D
                 blocks.append(_text_block("\n".join(lines)))
         elif role == "system":
             blocks.append(_text_block(f"[system]\n{_content_text(message.get('content'))}"))
-        if index == anchor and context_block:
-            blocks.append(context_block)
     flush_tool_results()
     return blocks or [_text_block("[user]\n(empty)")]
+
+
+# Receipt the agent loop puts in place of a skill's SYSTEM.md after its first
+# iteration (backend/agent_runtime/llm_loop.py). The full text already sent
+# stays valid, so the receipt is not an update.
+_SKILL_RECEIPT = re.compile(r'\[Skill ".*" is loaded\. Refer to earlier system message')
+
+_CONTEXT_HEADER = "[context]"
+_CONTEXT_UPDATE_HEADER = ("[context update] Each section below replaces the earlier "
+                          "value of the section with the same heading.")
+
+
+def _place_context(base: List[Dict[str, Any]], parts: List[tuple],
+                   log: List[Dict[str, Any]]):
+    """Insert context blocks into the history so they never move.
+
+    ``log`` holds the context blocks sent before, each anchored to the chain
+    hash of the history block it followed. Entries whose anchor is still in the
+    history are re-sent in place, byte for byte. Only sections whose value
+    changed since then go out as a new entry after the last history block, so
+    a datetime or agent-state change no longer invalidates the cached history.
+    When the history was rewritten (summary) the anchors are gone and the
+    whole context is sent again from scratch. Returns ``(blocks, log)``.
+    """
+    hashes = _block_hashes(base)
+    present = set(hashes)
+    kept = [entry for entry in log if entry["anchor"] == "" or entry["anchor"] in present]
+
+    sent: Dict[str, Optional[str]] = {}
+    for entry in kept:
+        sent.update(entry["values"])
+    current = dict(parts)
+    changed: Dict[str, Optional[str]] = {}
+    for key, text in current.items():
+        if sent.get(key) == text:
+            continue
+        if sent.get(key) is not None and _SKILL_RECEIPT.search(text):
+            continue
+        changed[key] = text
+    for key, text in sent.items():
+        if text is not None and key not in current:
+            changed[key] = None
+
+    if changed:
+        lines = [text if text is not None else f"{key}: (no longer active)"
+                 for key, text in changed.items()]
+        header = _CONTEXT_UPDATE_HEADER if sent else _CONTEXT_HEADER
+        kept = kept + [{"anchor": hashes[-1] if hashes else "",
+                        "values": changed,
+                        "text": header + "\n" + "\n\n".join(lines)}]
+
+    by_anchor: Dict[str, List[Dict[str, Any]]] = {}
+    for entry in kept:
+        by_anchor.setdefault(entry["anchor"], []).append(_text_block(entry["text"]))
+    blocks = list(by_anchor.get("", []))
+    for block, chain in zip(base, hashes):
+        blocks.append(block)
+        blocks.extend(by_anchor.get(chain, []))
+    return blocks, kept
 
 
 def _tool_instructions(tools: List[Dict[str, Any]], tool_choice: Optional[str]) -> str:
@@ -525,11 +587,14 @@ def send_request(
     if not binary:
         return _fail("connection_error", get_status()["error"], 0)
 
-    system_prompt, context, history = _split_system(messages)
+    system_prompt, parts, history = _split_system(messages)
     system_prompt = system_prompt or "You are a helpful assistant."
     if tools:
         system_prompt += _tool_instructions(tools, tool_choice)
-    blocks = _history_blocks(history, context)
+    base = _history_blocks(history)
+    key = _conversation_key(model, system_prompt, base)
+    previous = _conversation(key)
+    blocks, context_log = _place_context(base, parts, (previous or {}).get("context_log", []))
 
     cmd = [
         binary, "-p", "--model", model,
@@ -546,17 +611,16 @@ def send_request(
         cmd += ["--system-prompt", "Follow the instructions in the <system> block of the input."]
         blocks = [_text_block(f"<system>\n{system_prompt}\n</system>")] + blocks
 
-    key = _conversation_key(model, system_prompt, blocks)
     system_hash = _digest(system_prompt)
     hashes = _block_hashes(blocks)
-    diagnosis = _diagnose(_conversation(key), system_hash, hashes)
+    diagnosis = _diagnose(previous, system_hash, hashes)
 
     timeout = timeout or DEFAULT_TIMEOUT
     data, attempts, failure = _run_cli(cmd, blocks, timeout)
     if failure:
         return failure
     _remember(key, {"system_hash": system_hash, "hashes": hashes,
-                    "context_index": _context_index(blocks)})
+                    "context_index": _context_index(blocks), "context_log": context_log})
     runs = [data]
     native_attempts = list(attempts)
 
